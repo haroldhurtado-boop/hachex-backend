@@ -79,3 +79,31 @@ app.get("/health", (req, res) => {
 app.listen(PORT, () => {
   console.log(`✅ Hache X Backend corriendo en puerto ${PORT}`);
 });
+
+// ========================================
+// GET /duration?videoId=XXX
+// Obtiene la duración de un video en segundos
+// ========================================
+app.get("/duration", async (req, res) => {
+  const { videoId } = req.query;
+  if (!videoId) return res.status(400).json({ error: "Falta videoId" });
+
+  try {
+    const url = `https://www.youtube.com/watch?v=${videoId}`;
+    const response = await fetch(url, {
+      headers: {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36"
+      }
+    });
+    const html = await response.text();
+
+    // Buscar duración en el HTML
+    const match = html.match(/"lengthSeconds":"(\d+)"/);
+    if (!match) return res.status(404).json({ error: "No se encontró duración" });
+
+    res.json({ duration: parseInt(match[1]) });
+  } catch(e) {
+    console.error("Error /duration:", e);
+    res.status(500).json({ error: "Error interno" });
+  }
+});
