@@ -113,8 +113,51 @@ app.get("/duration", async (req, res) => {
 });
 
 // ========================================
-// GET /health
+// GET /soundcloud?q=nombre+artista
+// Busca en SoundCloud sin API key
 // ========================================
+
+app.get("/soundcloud", async (req, res) => {
+  const query = req.query.q;
+  if (!query) return res.status(400).json({ error: "Falta el parámetro q" });
+
+  try {
+    const searchUrl = `https://soundcloud.com/search?q=${encodeURIComponent(query)}`;
+    const response  = await fetch(searchUrl, {
+      headers: {
+        "User-Agent":      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36",
+        "Accept-Language": "es-ES,es;q=0.9"
+      }
+    });
+    const html = await response.text();
+
+    // Extraer hydration data de SoundCloud
+    const match = html.match(/window\.__sc_hydration\s*=\s*(\[.*?\]);/s);
+    if (!match) return res.status(500).json({ error: "No se pudo parsear SoundCloud" });
+
+    const hydration = JSON.parse(match[1]);
+    const collection = hydration.find(h => h.hydratable === "collection");
+    if (!collection) return res.status(404).json({ tracks: [] });
+
+    const tracks = (collection.data?.collection || [])
+      .filter(item => item.kind === "track")
+      .slice(0, 5)
+      .map(track => ({
+        trackUrl:  track.permalink_url,
+        title:     track.title,
+        artist:    track.user?.username || "",
+        duration:  Math.floor((track.duration || 0) / 1000),
+        artwork:   track.artwork_url || ""
+      }));
+
+    res.json({ tracks });
+  } catch(err) {
+    console.error("Error en /soundcloud:", err.message);
+    res.status(500).json({ error: "Error interno" });
+  }
+});
+
+
 
 app.get("/health", (req, res) => {
   res.json({ status: "ok", service: "Hache X Backend" });
