@@ -159,6 +159,18 @@ app.get("/soundcloud", async (req, res) => {
 
 
 
+app.get("/check", async (req, res) => {
+  const { videoId } = req.query;
+  if (!videoId) return res.status(400).json({ error: "Falta videoId" });
+  try {
+    const url      = `https://www.youtube.com/oembed?url=https://www.youtube.com/watch?v=${videoId}&format=json`;
+    const response = await fetch(url, { headers: { "User-Agent": "Mozilla/5.0" } });
+    res.json({ embeddable: response.ok });
+  } catch(e) {
+    res.json({ embeddable: false });
+  }
+});
+
 app.get("/health", (req, res) => {
   res.json({ status: "ok", service: "Hache X Backend" });
 });
