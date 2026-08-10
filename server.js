@@ -261,6 +261,78 @@ app.get("/duration", async (req, res) => {
   }
 });
  
+// ========================================
+// POST /genero
+// Segunda opinión de género vía IA (Claude Haiku), usada SOLO cuando el
+// filtro de palabras clave del frontend no pudo confirmar por sí solo el
+// género de una canción (ni a favor ni en contra). Body: { titulo, artista,
+// generos: [ids permitidos hoy] }.
+//
+// SIEMPRE responde algo — nunca deja al front colgado ni le devuelve un
+// error que rompa el flujo. Si Anthropic tarda más de ANTHROPIC_TIMEOUT_MS,
+// falla, o la respuesta no es interpretable, responde { genero: null } —
+// el front lo trata como "insegura" (deja pasar la canción con la alarma
+// para el DJ, nunca bloquea por una falla del servicio).
+// ========================================
+const ANTHROPIC_TIMEOUT_MS = 4000;
+
+app.post("/genero", async (req, res) => {
+  const { titulo, artista, generos } = req.body || {};
+
+  if (!titulo || !Array.isArray(generos) || generos.length === 0) {
+    return res.status(400).json({ error: "Faltan datos (titulo, generos)" });
+  }
+
+  if (!process.env.ANTHROPIC_API_KEY) {
+    console.warn("⚠️ ANTHROPIC_API_KEY no configurada — /genero responde sin verificar");
+    return res.json({ genero: null });
+  }
+
+  const listaGeneros = generos.join(", ");
+  const prompt = `Cancion: "${titulo}"${artista ? ` — Artista/canal: "${artista}"` : ""}
+
+Generos permitidos hoy: ${listaGeneros}
+
+Responde EXCLUSIVAMENTE con el id exacto de UNO de los generos permitidos de la lista de arriba si la cancion pertenece claramente a ese genero. Si la cancion NO pertenece a NINGUNO de los generos permitidos, responde exactamente: NO_COINCIDE. Si no tienes certeza suficiente para decidir, responde exactamente: INSEGURO. No agregues explicaciones ni texto adicional — responde solo esa palabra, nada mas.`;
+
+  try {
+    const aiRes = await fetchConTimeout(
+      "https://api.anthropic.com/v1/messages",
+      {
+        method: "POST",
+        headers: {
+          "Content-Type":     "application/json",
+          "x-api-key":        process.env.ANTHROPIC_API_KEY,
+          "anthropic-version": "2023-06-01"
+        },
+        body: JSON.stringify({
+          model:      "claude-haiku-4-5-20251001",
+          max_tokens: 20,
+          messages:   [{ role: "user", content: prompt }]
+        })
+      },
+      ANTHROPIC_TIMEOUT_MS
+    );
+
+    if (!aiRes.ok) {
+      console.error("⚠️ /genero: Anthropic respondió con status", aiRes.status);
+      return res.json({ genero: null });
+    }
+
+    const data  = await aiRes.json();
+    const texto = (data?.content?.[0]?.text || "").trim();
+
+    if (texto === "NO_COINCIDE") return res.json({ genero: "NO_COINCIDE" });
+    if (!generos.includes(texto)) return res.json({ genero: null }); // INSEGURO o respuesta rara → tratar como insegura
+
+    return res.json({ genero: texto });
+
+  } catch (err) {
+    console.error("Error en /genero:", err.message);
+    return res.json({ genero: null });
+  }
+});
+
 app.listen(PORT, () => {
   console.log(`✅ Hache X Backend corriendo en puerto ${PORT}`);
 });
