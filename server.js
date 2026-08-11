@@ -275,26 +275,32 @@ app.get("/duration", async (req, res) => {
 // para el DJ, nunca bloquea por una falla del servicio).
 // ========================================
 const ANTHROPIC_TIMEOUT_MS = 4000;
-
+ 
 app.post("/genero", async (req, res) => {
   const { titulo, artista, generos } = req.body || {};
-
+ 
   if (!titulo || !Array.isArray(generos) || generos.length === 0) {
     return res.status(400).json({ error: "Faltan datos (titulo, generos)" });
   }
-
+ 
+  console.log(`🎵 /genero: "${titulo}" — "${artista || "?"}" | permitidos: ${generos.join(",")}`);
+ 
   if (!process.env.ANTHROPIC_API_KEY) {
     console.warn("⚠️ ANTHROPIC_API_KEY no configurada — /genero responde sin verificar");
     return res.json({ genero: null });
   }
-
+ 
   const listaGeneros = generos.join(", ");
   const prompt = `Cancion: "${titulo}"${artista ? ` — Artista/canal: "${artista}"` : ""}
-
+ 
 Generos permitidos hoy: ${listaGeneros}
-
-Responde EXCLUSIVAMENTE con el id exacto de UNO de los generos permitidos de la lista de arriba si la cancion pertenece claramente a ese genero. Si la cancion NO pertenece a NINGUNO de los generos permitidos, responde exactamente: NO_COINCIDE. Si no tienes certeza suficiente para decidir, responde exactamente: INSEGURO. No agregues explicaciones ni texto adicional — responde solo esa palabra, nada mas.`;
-
+ 
+Responde EXCLUSIVAMENTE con el id exacto de UNO de los generos permitidos de la lista de arriba si la cancion pertenece claramente a ese genero. Si la cancion NO pertenece a NINGUNO de los generos permitidos, responde exactamente: NO_COINCIDE.
+ 
+Si reconoces la cancion o el artista, aunque sea parcialmente o por un nombre de canal poco claro, responde con tu mejor clasificacion en vez de dudar — tu conocimiento general de musica es confiable para esto. Responde INSEGURO UNICAMENTE cuando genuinamente no reconoces ni la cancion ni el artista, o el genero es realmente ambiguo entre dos generos de la lista.
+ 
+No agregues explicaciones ni texto adicional — responde solo esa palabra, nada mas.`;
+ 
   try {
     const aiRes = await fetchConTimeout(
       "https://api.anthropic.com/v1/messages",
@@ -313,26 +319,32 @@ Responde EXCLUSIVAMENTE con el id exacto de UNO de los generos permitidos de la 
       },
       ANTHROPIC_TIMEOUT_MS
     );
-
+ 
     if (!aiRes.ok) {
-      console.error("⚠️ /genero: Anthropic respondió con status", aiRes.status);
+      const cuerpoError = await aiRes.text().catch(() => "(no se pudo leer el cuerpo)");
+      console.error(`⚠️ /genero: Anthropic respondió status ${aiRes.status} — ${cuerpoError}`);
       return res.json({ genero: null });
     }
-
+ 
     const data  = await aiRes.json();
     const texto = (data?.content?.[0]?.text || "").trim();
-
+ 
+    console.log(`🎵 /genero: "${titulo}" → Claude respondió "${texto}"`);
+ 
     if (texto === "NO_COINCIDE") return res.json({ genero: "NO_COINCIDE" });
-    if (!generos.includes(texto)) return res.json({ genero: null }); // INSEGURO o respuesta rara → tratar como insegura
-
+    if (!generos.includes(texto)) {
+      if (texto !== "INSEGURO") console.warn(`⚠️ /genero: respuesta inesperada de Claude ("${texto}"), tratando como insegura`);
+      return res.json({ genero: null }); // INSEGURO o respuesta rara → tratar como insegura
+    }
+ 
     return res.json({ genero: texto });
-
+ 
   } catch (err) {
-    console.error("Error en /genero:", err.message);
+    console.error(`Error en /genero ("${titulo}"):`, err.message);
     return res.json({ genero: null });
   }
 });
-
+ 
 app.listen(PORT, () => {
   console.log(`✅ Hache X Backend corriendo en puerto ${PORT}`);
 });
