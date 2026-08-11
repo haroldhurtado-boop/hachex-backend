@@ -312,7 +312,7 @@ No agregues explicaciones ni texto adicional — responde solo esa palabra, nada
           "anthropic-version": "2023-06-01"
         },
         body: JSON.stringify({
-          model:      "claude-haiku-4-5-20251001",
+          model:      "claude-sonnet-5",
           max_tokens: 20,
           messages:   [{ role: "user", content: prompt }]
         })
@@ -348,4 +348,3 @@ No agregues explicaciones ni texto adicional — responde solo esa palabra, nada
 app.listen(PORT, () => {
   console.log(`✅ Hache X Backend corriendo en puerto ${PORT}`);
 });
- 
