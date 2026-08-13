@@ -266,7 +266,22 @@ app.get("/duration", async (req, res) => {
 // Segunda opinión de género vía IA (Claude Haiku), usada SOLO cuando el
 // filtro de palabras clave del frontend no pudo confirmar por sí solo el
 // género de una canción (ni a favor ni en contra). Body: { titulo, artista,
-// generos: [ids permitidos hoy] }.
+// generos: [ids permitidos hoy], segundaOpinion: true|false }.
+//
+// DOS PISOS (ago-2026): Haiku responde siempre primero (rápido). Si Haiku
+// dice INSEGURO y el llamador pidió segundaOpinion:true, se le pregunta a
+// Sonnet como árbitro antes de decidir — más preciso en artistas poco
+// conocidos, a cambio de 1-3s extra SOLO en ese caso ambiguo (la mayoría de
+// las canciones las resuelve Haiku solo, sin ese costo). Si Haiku ya
+// respondió con confianza (coincide o no_coincide), Sonnet ni se consulta.
+//
+// Quién pide segundaOpinion:true — usuarios.html (verificarFiltroGenero):
+// hay un cliente real esperando en el momento, vale la pena la precisión
+// extra para no bloquear por error (caso real: "Magia Rosa" de Viti Ruiz).
+// Quién NO la pide (segundaOpinion:false u omitido) — el Piloto Automático:
+// nadie espera en vivo, y la mayoría de sus candidatos ya vienen resueltos
+// del caché que dejó usuarios.html, así que casi nunca llega a necesitar
+// siquiera el primer piso.
 //
 // SIEMPRE responde algo — nunca deja al front colgado ni le devuelve un
 // error que rompa el flujo. Si Anthropic tarda más de ANTHROPIC_TIMEOUT_MS,
@@ -276,14 +291,57 @@ app.get("/duration", async (req, res) => {
 // ========================================
 const ANTHROPIC_TIMEOUT_MS = 4000;
  
+function construirPromptGenero(titulo, artista, listaGeneros) {
+  return `Cancion: "${titulo}"${artista ? ` — Artista/canal: "${artista}"` : ""}
+ 
+Generos permitidos hoy: ${listaGeneros}
+ 
+Responde EXCLUSIVAMENTE con el id exacto de UNO de los generos permitidos de la lista de arriba si la cancion pertenece claramente a ese genero — aqui si reconoces la cancion o el artista, aunque sea parcialmente o por un nombre de canal poco claro, responde con tu mejor clasificacion en vez de dudar.
+ 
+NO_COINCIDE es una decision seria: bloquea a un cliente real de un bar en el momento en que esta pidiendo su cancion. Uselo UNICAMENTE cuando esta SEGURO de cual es el genero real de la cancion Y ese genero claramente no es ninguno de los permitidos (ej: reconoce que es reggaeton y reggaeton no esta en la lista). Si el artista le resulta poco conocido, no esta seguro de su genero exacto, o solo tiene una sospecha sin certeza real, NO use NO_COINCIDE — responda INSEGURO en su lugar. Ante cualquier duda genuina sobre el genero real de la cancion, la respuesta correcta es INSEGURO, nunca NO_COINCIDE.
+ 
+No agregues explicaciones ni texto adicional — responde solo esa palabra, nada mas.`;
+}
+ 
+// Una sola llamada a Anthropic con el modelo indicado. Devuelve el texto
+// crudo de la respuesta (ya recortado), o null si algo falló.
+async function preguntarleAClaude(prompt, modelo) {
+  const aiRes = await fetchConTimeout(
+    "https://api.anthropic.com/v1/messages",
+    {
+      method: "POST",
+      headers: {
+        "Content-Type":     "application/json",
+        "x-api-key":        process.env.ANTHROPIC_API_KEY,
+        "anthropic-version": "2023-06-01"
+      },
+      body: JSON.stringify({
+        model:      modelo,
+        max_tokens: 20,
+        messages:   [{ role: "user", content: prompt }]
+      })
+    },
+    ANTHROPIC_TIMEOUT_MS
+  );
+ 
+  if (!aiRes.ok) {
+    const cuerpoError = await aiRes.text().catch(() => "(no se pudo leer el cuerpo)");
+    console.error(`⚠️ /genero (${modelo}): Anthropic respondió status ${aiRes.status} — ${cuerpoError}`);
+    return null;
+  }
+ 
+  const data = await aiRes.json();
+  return (data?.content?.[0]?.text || "").trim();
+}
+ 
 app.post("/genero", async (req, res) => {
-  const { titulo, artista, generos } = req.body || {};
+  const { titulo, artista, generos, segundaOpinion } = req.body || {};
  
   if (!titulo || !Array.isArray(generos) || generos.length === 0) {
     return res.status(400).json({ error: "Faltan datos (titulo, generos)" });
   }
  
-  console.log(`🎵 /genero: "${titulo}" — "${artista || "?"}" | permitidos: ${generos.join(",")}`);
+  console.log(`🎵 /genero: "${titulo}" — "${artista || "?"}" | permitidos: ${generos.join(",")} | segundaOpinion=${!!segundaOpinion}`);
  
   if (!process.env.ANTHROPIC_API_KEY) {
     console.warn("⚠️ ANTHROPIC_API_KEY no configurada — /genero responde sin verificar");
@@ -291,49 +349,30 @@ app.post("/genero", async (req, res) => {
   }
  
   const listaGeneros = generos.join(", ");
-  const prompt = `Cancion: "${titulo}"${artista ? ` — Artista/canal: "${artista}"` : ""}
- 
-Generos permitidos hoy: ${listaGeneros}
- 
-Responde EXCLUSIVAMENTE con el id exacto de UNO de los generos permitidos de la lista de arriba si la cancion pertenece claramente a ese genero. Si la cancion NO pertenece a NINGUNO de los generos permitidos, responde exactamente: NO_COINCIDE.
- 
-Si reconoces la cancion o el artista, aunque sea parcialmente o por un nombre de canal poco claro, responde con tu mejor clasificacion en vez de dudar — tu conocimiento general de musica es confiable para esto. Responde INSEGURO UNICAMENTE cuando genuinamente no reconoces ni la cancion ni el artista, o el genero es realmente ambiguo entre dos generos de la lista.
- 
-No agregues explicaciones ni texto adicional — responde solo esa palabra, nada mas.`;
+  const prompt = construirPromptGenero(titulo, artista, listaGeneros);
  
   try {
-    const aiRes = await fetchConTimeout(
-      "https://api.anthropic.com/v1/messages",
-      {
-        method: "POST",
-        headers: {
-          "Content-Type":     "application/json",
-          "x-api-key":        process.env.ANTHROPIC_API_KEY,
-          "anthropic-version": "2023-06-01"
-        },
-        body: JSON.stringify({
-          model:      "claude-sonnet-5",
-          max_tokens: 20,
-          messages:   [{ role: "user", content: prompt }]
-        })
-      },
-      ANTHROPIC_TIMEOUT_MS
-    );
+    // ── Piso 1: Haiku (siempre) ──
+    let texto = await preguntarleAClaude(prompt, "claude-haiku-4-5-20251001");
+    if (texto === null) return res.json({ genero: null }); // falló Anthropic → insegura, nunca bloquea
  
-    if (!aiRes.ok) {
-      const cuerpoError = await aiRes.text().catch(() => "(no se pudo leer el cuerpo)");
-      console.error(`⚠️ /genero: Anthropic respondió status ${aiRes.status} — ${cuerpoError}`);
-      return res.json({ genero: null });
+    console.log(`🎵 /genero: "${titulo}" → Haiku respondió "${texto}"`);
+ 
+    // ── Piso 2: Sonnet, SOLO si Haiku quedó insegura y el llamador lo pidió ──
+    const haikuInsegura = texto !== "NO_COINCIDE" && !generos.includes(texto);
+    if (haikuInsegura && segundaOpinion === true) {
+      const textoSonnet = await preguntarleAClaude(prompt, "claude-sonnet-5");
+      if (textoSonnet !== null) {
+        console.log(`🎵 /genero: "${titulo}" → segunda opinión Sonnet respondió "${textoSonnet}"`);
+        texto = textoSonnet; // Sonnet manda la decisión final
+      }
+      // Si Sonnet falla, se sigue con lo que ya dijo Haiku (insegura) — nunca
+      // se deja al front sin respuesta por culpa del segundo piso.
     }
- 
-    const data  = await aiRes.json();
-    const texto = (data?.content?.[0]?.text || "").trim();
- 
-    console.log(`🎵 /genero: "${titulo}" → Claude respondió "${texto}"`);
  
     if (texto === "NO_COINCIDE") return res.json({ genero: "NO_COINCIDE" });
     if (!generos.includes(texto)) {
-      if (texto !== "INSEGURO") console.warn(`⚠️ /genero: respuesta inesperada de Claude ("${texto}"), tratando como insegura`);
+      if (texto !== "INSEGURO") console.warn(`⚠️ /genero: respuesta inesperada ("${texto}"), tratando como insegura`);
       return res.json({ genero: null }); // INSEGURO o respuesta rara → tratar como insegura
     }
  
@@ -348,3 +387,4 @@ No agregues explicaciones ni texto adicional — responde solo esa palabra, nada
 app.listen(PORT, () => {
   console.log(`✅ Hache X Backend corriendo en puerto ${PORT}`);
 });
+ 
