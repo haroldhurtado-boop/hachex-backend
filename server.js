@@ -358,16 +358,23 @@ app.post("/genero", async (req, res) => {
  
     console.log(`🎵 /genero: "${titulo}" → Haiku respondió "${texto}"`);
  
-    // ── Piso 2: Sonnet, SOLO si Haiku quedó insegura y el llamador lo pidió ──
-    const haikuInsegura = texto !== "NO_COINCIDE" && !generos.includes(texto);
-    if (haikuInsegura && segundaOpinion === true) {
+    // ── Piso 2: Sonnet, SOLO si Haiku va a BLOQUEAR y el llamador lo pidió ──
+    // 🩹 (ago-2026 fix) Antes esta condición EXCLUÍA "NO_COINCIDE" a propósito
+    // por error — dejaba pasar a Sonnet solo las respuestas raras/inseguras,
+    // pero un NO_COINCIDE directo de Haiku (el caso real: no reconoció a Viti
+    // Ruiz y bloqueó "Magia Rosa", que sí era salsa permitida) nunca llegaba
+    // a pedir el arbitraje. Ahora cualquier resultado que vaya a terminar en
+    // bloqueo pasa por Sonnet antes de decidir — es exactamente para ESO que
+    // se pidió la segunda opinión.
+    const haikuBloquearia = texto === "NO_COINCIDE" || !generos.includes(texto);
+    if (haikuBloquearia && segundaOpinion === true) {
       const textoSonnet = await preguntarleAClaude(prompt, "claude-sonnet-5");
       if (textoSonnet !== null) {
         console.log(`🎵 /genero: "${titulo}" → segunda opinión Sonnet respondió "${textoSonnet}"`);
         texto = textoSonnet; // Sonnet manda la decisión final
       }
-      // Si Sonnet falla, se sigue con lo que ya dijo Haiku (insegura) — nunca
-      // se deja al front sin respuesta por culpa del segundo piso.
+      // Si Sonnet falla, se sigue con lo que ya dijo Haiku — nunca se deja al
+      // front sin respuesta por culpa del segundo piso.
     }
  
     if (texto === "NO_COINCIDE") return res.json({ genero: "NO_COINCIDE" });
@@ -387,4 +394,3 @@ app.post("/genero", async (req, res) => {
 app.listen(PORT, () => {
   console.log(`✅ Hache X Backend corriendo en puerto ${PORT}`);
 });
- 
