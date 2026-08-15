@@ -55,9 +55,14 @@ app.get("/search", async (req, res) => {
     const contents = data?.contents?.twoColumnSearchResultsRenderer?.primaryContents
       ?.sectionListRenderer?.contents?.[0]?.itemSectionRenderer?.contents || [];
  
+    // 🩹 (ago-2026) Antes se tomaban solo los primeros 6 — YouTube ya trae
+    // muchos más en la MISMA respuesta que se descargó, así que subir este
+    // tope a 20 no agrega ni una sola petición nueva a YouTube: solo se lee
+    // más de lo que ya llegó. Pedido del DJ: en hora pico, con solo 2-3
+    // letras necesita ver varias opciones, no 5-6.
     const videos = contents
       .filter(c => c.videoRenderer)
-      .slice(0, 6)
+      .slice(0, 20)
       .map(c => {
         const v = c.videoRenderer;
         return {
@@ -394,3 +399,4 @@ app.post("/genero", async (req, res) => {
 app.listen(PORT, () => {
   console.log(`✅ Hache X Backend corriendo en puerto ${PORT}`);
 });
+ 
