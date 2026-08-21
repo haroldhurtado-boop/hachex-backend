@@ -159,7 +159,15 @@ app.get("/search", async (req, res) => {
     const response  = await fetchConTimeout(searchUrl, { headers: HEADERS });
     const html      = await response.text();
     const match     = html.match(/var ytInitialData = ({.*?});/s);
-    if (!match) return res.status(500).json({ error: "No se pudo parsear YouTube" });
+    if (!match) {
+      // 🔍 Diagnóstico temporal (ago-2026): antes solo se sabía que falló el
+      // parseo, no POR QUÉ. Esto revela si YouTube está devolviendo un
+      // captcha/verificación de bot, una página de consentimiento, un error
+      // HTTP, o si de verdad cambió su estructura — sin esto es adivinar.
+      console.error(`⚠️ /search: no se pudo parsear "${query}" — status HTTP: ${response.status}`);
+      console.error(`⚠️ /search: primeros 500 caracteres de la respuesta:`, html.slice(0, 500));
+      return res.status(500).json({ error: "No se pudo parsear YouTube", statusYoutube: response.status });
+    }
 
     const data     = JSON.parse(match[1]);
     const contents = data?.contents?.twoColumnSearchResultsRenderer?.primaryContents
