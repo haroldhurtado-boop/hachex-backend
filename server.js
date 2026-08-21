@@ -1,7 +1,9 @@
 const express  = require("express");
 const cors     = require("cors");
 const fetch    = require("node-fetch");
+const fs       = require("fs");
 const { HttpsProxyAgent } = require("https-proxy-agent");
+const admin    = require("firebase-admin");
 
 const app  = express();
 const PORT = process.env.PORT || 3000;
@@ -19,16 +21,10 @@ const HEADERS = {
 // ========================================
 // QuotaGuard Static IP (ago-2026)
 // Todas las peticiones a YouTube (search, check, audio, duration) salen a
-// través de esta IP fija y exclusiva de Hache X, en vez de la IP compartida
-// de Render — esto es lo que evita que tráfico de OTROS clientes de Render
-// contamine la reputación de la IP y dispare el bloqueo google_abuse que
-// veíamos en los logs. Requiere la variable de entorno QUOTAGUARDSTATIC_URL
-// en Render (Dashboard → Environment). Si no está configurada, el server
-// sigue funcionando igual que antes (sin proxy) — no rompe nada en local.
-//
-// La llamada a Anthropic en /genero NO pasa por este proxy a propósito: no
-// tiene relación con el bloqueo de YouTube y no vale la pena gastarle ancho
-// de banda al plan de QuotaGuard con eso.
+// través de esta IP fija, en vez de la IP compartida de Render — evita que
+// tráfico de otros clientes de Render contamine la reputación de la IP.
+// Requiere QUOTAGUARDSTATIC_URL en Render (Environment). Si no está
+// configurada, el server sigue funcionando igual (sin proxy).
 // ========================================
 const QUOTAGUARD_URL = process.env.QUOTAGUARDSTATIC_URL || null;
 const proxyAgent = QUOTAGUARD_URL ? new HttpsProxyAgent(QUOTAGUARD_URL) : null;
@@ -37,6 +33,53 @@ if (proxyAgent) {
   console.log("✅ QuotaGuard Static IP activo — peticiones a YouTube saldrán por IP fija");
 } else {
   console.warn("⚠️ QUOTAGUARDSTATIC_URL no configurada — peticiones a YouTube van por IP compartida de Render");
+}
+
+// ========================================
+// Firebase Admin — caché de búsquedas (ago-2026)
+// Antes de raspar YouTube en /search, se consulta si esa misma búsqueda ya
+// fue resuelta en los últimos CACHE_TTL_MS — si sí, se devuelve el caché y
+// YouTube ni se toca. Reduce drásticamente el volumen de scraping, que es
+// la causa raíz del riesgo de bloqueo (el proxy de arriba ataca el síntoma
+// de la IP; esto ataca el volumen de peticiones en sí).
+//
+// Usa el service account en /etc/secrets/firebase-service-account.json
+// (Secret File de Render) — NUNCA se sube al repo. Si el archivo no está
+// presente (ej. corriendo en local sin configurarlo), el caché queda
+// desactivado y el server sigue funcionando exactamente como antes: nunca
+// se rompe una búsqueda por falta de Firebase.
+// ========================================
+const SERVICE_ACCOUNT_PATH = "/etc/secrets/firebase-service-account.json";
+const CACHE_TTL_MS = 15 * 24 * 60 * 60 * 1000; // 15 días
+
+let db = null;
+
+if (fs.existsSync(SERVICE_ACCOUNT_PATH)) {
+  try {
+    const serviceAccount = require(SERVICE_ACCOUNT_PATH);
+    admin.initializeApp({
+      credential: admin.credential.cert(serviceAccount),
+      databaseURL: "https://hache-beatlinks-default-rtdb.firebaseio.com"
+    });
+    db = admin.database();
+    console.log("✅ Firebase Admin conectado — caché de búsquedas activo");
+  } catch (err) {
+    console.error("⚠️ Error inicializando Firebase Admin — caché desactivado:", err.message);
+  }
+} else {
+  console.warn("⚠️ firebase-service-account.json no encontrado — caché de búsquedas desactivado, todo va directo a YouTube");
+}
+
+// Convierte el texto de búsqueda en una key válida para Firebase RTDB
+// (no admite ".", "#", "$", "[", "]", "/"). Minúsculas + espacios a "_" para
+// que "Bad Bunny" y "bad   bunny" caigan en la MISMA entrada de caché.
+function normalizarClaveCache(query) {
+  return query
+    .toLowerCase()
+    .trim()
+    .replace(/\s+/g, "_")
+    .replace(/[.#$\[\]\/]/g, "")
+    .substring(0, 200);
 }
 
 // ========================================
@@ -66,17 +109,52 @@ async function fetchConTimeout(url, options = {}, timeoutMs = 8000, viaProxy = t
 // GET /health
 // ========================================
 app.get("/health", (req, res) => {
-  res.json({ status: "ok", service: "Hache X Backend", quotaguard: !!proxyAgent });
+  res.json({
+    status: "ok",
+    service: "Hache X Backend",
+    quotaguard: !!proxyAgent,
+    cache: !!db
+  });
 });
 
 // ========================================
 // GET /search?q=nombre+artista
+// Primero consulta el caché de Firebase (cacheBusquedas). Si hay una
+// entrada vigente (menos de CACHE_TTL_MS), la devuelve directo — YouTube ni
+// se toca. Si no hay caché o venció, raspa YouTube como siempre y guarda el
+// resultado nuevo para la próxima vez (fire-and-forget: no bloquea la
+// respuesta al cliente si Firebase tarda en escribir).
 // ========================================
 app.get("/search", async (req, res) => {
   const query = req.query.q;
   if (!query) return res.status(400).json({ error: "Falta el parámetro q" });
 
+  const clave = normalizarClaveCache(query);
+  const cacheRef = db ? db.ref(`cacheBusquedas/${clave}`) : null;
+
   try {
+    // ── Intentar servir desde caché ──
+    if (cacheRef) {
+      try {
+        const snapshot = await cacheRef.once("value");
+        const cacheado = snapshot.val();
+        if (cacheado && cacheado.videos && (Date.now() - cacheado.timestamp) < CACHE_TTL_MS) {
+          console.log(`💾 /search: "${query}" servido desde caché (${cacheado.videos.length} resultados)`);
+          // Renovar el timestamp en cada hit (fire-and-forget) — una
+          // búsqueda con demanda activa nunca vence mientras la sigan
+          // pidiendo; solo vencen las que de verdad dejaron de buscarse.
+          cacheRef.update({ timestamp: Date.now() })
+            .catch(err => console.error("⚠️ Error renovando timestamp de caché:", err.message));
+          return res.json({ videos: cacheado.videos, cache: true });
+        }
+      } catch (err) {
+        // Si falla la lectura del caché, seguir con scraping normal —
+        // nunca dejar al cliente sin resultados por un problema de Firebase.
+        console.error("⚠️ Error leyendo caché, se sigue con YouTube directo:", err.message);
+      }
+    }
+
+    // ── No hay caché válido: raspar YouTube ──
     const searchUrl = `https://www.youtube.com/results?search_query=${encodeURIComponent(query)}`;
     const response  = await fetchConTimeout(searchUrl, { headers: HEADERS });
     const html      = await response.text();
@@ -106,7 +184,16 @@ app.get("/search", async (req, res) => {
         };
       });
 
-    res.json({ videos });
+    // ── Guardar en caché para la próxima vez (no bloquea la respuesta) ──
+    if (cacheRef && videos.length > 0) {
+      cacheRef.set({
+        query,
+        videos,
+        timestamp: Date.now()
+      }).catch(err => console.error("⚠️ Error guardando en caché:", err.message));
+    }
+
+    res.json({ videos, cache: false });
   } catch (err) {
     console.error("Error en /search:", err.message);
     res.status(500).json({ error: "Error interno del servidor" });
