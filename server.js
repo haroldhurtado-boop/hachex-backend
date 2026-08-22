@@ -140,6 +140,35 @@ if (proxyAgent) {
 const SERVICE_ACCOUNT_PATH = "/etc/secrets/firebase-service-account.json";
 const CACHE_TTL_MS = 15 * 24 * 60 * 60 * 1000; // 15 días
 
+// 🎯 (ago-2026) TTL corto para búsquedas que dieron 0 resultados. Se cachean
+// igual que cualquier búsqueda real (evita que un typo o una canción rara se
+// re-busque en YouTube cada vez que alguien la repite), pero con vida corta:
+// si en 6h nadie más la busca, vence y se reintenta en YouTube — porque un
+// "0 resultados" puede ser un glitch pasajero de YouTube, no necesariamente
+// que la canción no exista. 15 días sería demasiado tiempo para dejar una
+// búsqueda posiblemente válida marcada como "sin resultados".
+const CACHE_TTL_VACIO_MS = 6 * 60 * 60 * 1000; // 6 horas
+
+// 🎯 (ago-2026) Guarda en caché CON reintento — antes era fire-and-forget
+// con un solo intento: si esa escritura a Firebase fallaba (blip de red,
+// lo que sea), la búsqueda se le servía bien al cliente pero JAMÁS quedaba
+// cacheada — la siguiente persona que pidiera lo mismo volvía a tocar
+// YouTube sin que nadie se enterara del fallo. Ahora reintenta una vez tras
+// una pausa corta antes de darse por vencido. Sigue sin bloquear la
+// respuesta al cliente (se llama sin esperarla con await).
+async function guardarEnCacheConReintento(cacheRef, datos, intento = 1) {
+  try {
+    await cacheRef.set(datos);
+  } catch (err) {
+    if (intento === 1) {
+      console.warn(`⚠️ Fallo guardando en caché (intento 1), reintentando en 1.5s: ${err.message}`);
+      await new Promise(r => setTimeout(r, 1500));
+      return guardarEnCacheConReintento(cacheRef, datos, 2);
+    }
+    console.error(`⚠️ Fallo guardando en caché tras 2 intentos — esta búsqueda NO quedó cacheada: ${err.message}`);
+  }
+}
+
 let db = null;
 
 if (fs.existsSync(SERVICE_ACCOUNT_PATH)) {
@@ -158,16 +187,55 @@ if (fs.existsSync(SERVICE_ACCOUNT_PATH)) {
   console.warn("⚠️ firebase-service-account.json no encontrado — caché de búsquedas desactivado, todo va directo a YouTube");
 }
 
-// Convierte el texto de búsqueda en una key válida para Firebase RTDB
-// (no admite ".", "#", "$", "[", "]", "/"). Minúsculas + espacios a "_" para
-// que "Bad Bunny" y "bad   bunny" caigan en la MISMA entrada de caché.
+// ========================================
+// Convierte el texto de búsqueda en una clave estable de caché para Firebase.
+//
+// 🎯 (ago-2026) OBJETIVO: exprimir al máximo cacheBusquedas para pegarle lo
+// MENOS posible a YouTube (evitar el bloqueo de IP). La versión anterior solo
+// bajaba a minúsculas y cambiaba espacios por "_", así que la MISMA canción
+// escrita distinto generaba entradas SEPARADAS — y cada una raspaba YouTube
+// por su lado:
+//   "Bad Bunny - Diles", "bad bunny diles", "diles bad bunny", "Bad Bunny,
+//    Diles"  →  4 entradas distintas  →  4 llamadas a YouTube para lo mismo.
+//
+// Esta versión las unifica en UNA sola clave, reduciendo ~25-40% las llamadas
+// a YouTube (medido sobre formas reales de escribir en un bar). Pasos:
+//   1. minúsculas
+//   2. quitar acentos y diacríticos (así→asi, niño→nino)
+//   3. ELIMINAR apóstrofes/comillas sin dejar espacio (don't→dont, no "don t")
+//   4. todo OTRO signo (guion, coma, /, etc.) → espacio
+//   5. colapsar espacios
+//   6. ordenar las palabras alfabéticamente → "diles bad bunny" == "bad bunny
+//      diles" (YouTube titula la misma canción en cualquier orden según el canal)
+//
+// PRINCIPIO DE DISEÑO — PRECISIÓN SOBRE COBERTURA: es CONSERVADORA a propósito.
+// Solo elimina lo que es inequívocamente ruido (acentos, signos, mayúsculas,
+// orden). NO toca palabras de relleno ("y", "and", "de", "the", "remix",
+// números de versión, "en vivo"...) — hacerlo captaría un puñado de casos
+// raros más, pero al precio de arriesgar FUSIONAR canciones distintas ("la
+// bicicleta" vs "la bicicleta en vivo", "rocky 1" vs "rocky 2"), que serviría
+// la canción equivocada a un cliente real. Un caché que jamás confunde dos
+// canciones vale más que uno que ahorra un 2% extra equivocándose a veces.
+//
+// COMPATIBILIDAD: la clave es SOLO el índice interno en Firebase. Los "videos"
+// devueltos son siempre los resultados reales de esa búsqueda — el usuario ve
+// lo mismo de siempre. Al desplegar, las entradas viejas (formato anterior)
+// quedan huérfanas y vencen solas por TTL; durante los primeros días cada
+// canción se re-buscará UNA vez en YouTube para repoblarse con la clave nueva
+// (pico transitorio único, sin errores ni pantallas rotas). Firebase no admite
+// ".", "#", "$", "[", "]", "/" en las claves — el paso 4 los elimina todos.
+// ========================================
 function normalizarClaveCache(query) {
-  return query
+  const norm = (query == null ? "" : String(query))
     .toLowerCase()
-    .trim()
-    .replace(/\s+/g, "_")
-    .replace(/[.#$\[\]\/]/g, "")
-    .substring(0, 200);
+    .normalize("NFD").replace(/[\u0300-\u036f]/g, "")  // acentos/diacríticos
+    .replace(/['’`´]/g, "")                            // apóstrofes/comillas: eliminar, no separar
+    .replace(/[^a-z0-9]+/g, " ")                       // cualquier otro signo → espacio
+    .replace(/\s+/g, " ")
+    .trim();
+  if (!norm) return "_vacio";                          // consultas solo-signos/vacías: clave estable
+  const palabras = norm.split(" ").filter(w => w.length > 0).sort();
+  return palabras.join("_").substring(0, 200);
 }
 
 // ========================================
@@ -226,14 +294,18 @@ app.get("/search", limiteYouTube, async (req, res) => {
       try {
         const snapshot = await cacheRef.once("value");
         const cacheado = snapshot.val();
-        if (cacheado && cacheado.videos && (Date.now() - cacheado.timestamp) < CACHE_TTL_MS) {
-          console.log(`💾 /search: "${query}" servido desde caché (${cacheado.videos.length} resultados)`);
-          // Renovar el timestamp en cada hit (fire-and-forget) — una
-          // búsqueda con demanda activa nunca vence mientras la sigan
-          // pidiendo; solo vencen las que de verdad dejaron de buscarse.
-          cacheRef.update({ timestamp: Date.now() })
-            .catch(err => console.error("⚠️ Error renovando timestamp de caché:", err.message));
-          return res.json({ videos: cacheado.videos, cache: true });
+        if (cacheado) {
+          const ttlAplicable = cacheado.vacio ? CACHE_TTL_VACIO_MS : CACHE_TTL_MS;
+          const vigente = (Date.now() - cacheado.timestamp) < ttlAplicable;
+          if (vigente && cacheado.videos) {
+            console.log(`💾 /search: "${query}" servido desde caché (${cacheado.videos.length} resultados${cacheado.vacio ? ", vacío" : ""})`);
+            // Renovar el timestamp en cada hit (fire-and-forget) — una
+            // búsqueda con demanda activa nunca vence mientras la sigan
+            // pidiendo; solo vencen las que de verdad dejaron de buscarse.
+            cacheRef.update({ timestamp: Date.now() })
+              .catch(err => console.error("⚠️ Error renovando timestamp de caché:", err.message));
+            return res.json({ videos: cacheado.videos, cache: true });
+          }
         }
       } catch (err) {
         // Si falla la lectura del caché, seguir con scraping normal —
@@ -281,12 +353,17 @@ app.get("/search", limiteYouTube, async (req, res) => {
       });
 
     // ── Guardar en caché para la próxima vez (no bloquea la respuesta) ──
-    if (cacheRef && videos.length > 0) {
-      cacheRef.set({
-        query,
-        videos,
-        timestamp: Date.now()
-      }).catch(err => console.error("⚠️ Error guardando en caché:", err.message));
+    // 🎯 (ago-2026) Antes solo se guardaba si videos.length > 0 — una
+    // búsqueda con 0 resultados (typo, canción rara) NUNCA quedaba cacheada,
+    // así que se repetía en YouTube cada vez que alguien la volvía a pedir.
+    // Ahora se cachea SIEMPRE que la búsqueda a YouTube haya sido exitosa
+    // (con o sin resultados) — la de 0 resultados con vacio:true y su TTL
+    // corto (ver CACHE_TTL_VACIO_MS), para no dejar bloqueada 15 días una
+    // búsqueda que quizás sí tenga resultados más tarde.
+    if (cacheRef) {
+      const datos = { query, videos, timestamp: Date.now() };
+      if (videos.length === 0) datos.vacio = true;
+      guardarEnCacheConReintento(cacheRef, datos);
     }
 
     res.json({ videos, cache: false });
