@@ -1,5 +1,6 @@
 const express  = require("express");
 const cors     = require("cors");
+const rateLimit = require("express-rate-limit");
 const fetch    = require("node-fetch");
 const fs       = require("fs");
 const { HttpsProxyAgent } = require("https-proxy-agent");
@@ -8,8 +9,95 @@ const admin    = require("firebase-admin");
 const app  = express();
 const PORT = process.env.PORT || 3000;
 
-app.use(cors());
-app.use(express.json());
+// ========================================
+// SEGURIDAD — CORS restringido a dominios propios (ago-2026)
+// Antes: app.use(cors()) sin argumentos → el backend respondía a CUALQUIER
+// web del mundo, permitiendo que un tercero usara este servidor como su
+// propio proveedor gratis de scraping de YouTube (gastando el ancho de banda
+// de QuotaGuard y arriesgando el bloqueo de la IP fija). Ahora solo se
+// aceptan peticiones cuyo Origin sea uno de los dominios de Hache X.
+//
+// IMPORTANTE: incluir TODOS los dominios reales desde los que se sirve el
+// frontend — omitir uno rompe ese dominio por completo. Se pueden agregar
+// más sin tocar código con la variable CORS_EXTRA_ORIGINS (lista separada
+// por comas) en Render.
+//
+// Nota: peticiones sin Origin (curl, health checks de Render, apps móviles
+// nativas) se permiten a propósito — el navegador es quien envía Origin, y
+// bloquear su ausencia rompería el /health que Render usa para el keep-alive.
+const ORIGENES_PERMITIDOS = [
+  "https://hachexmusic.com",
+  "https://www.hachexmusic.com",
+  "https://hache-beatlinks.web.app",
+  "https://hache-beatlinks.firebaseapp.com",
+  "https://hachex-pruebas.web.app",
+  ...(process.env.CORS_EXTRA_ORIGINS
+      ? process.env.CORS_EXTRA_ORIGINS.split(",").map(s => s.trim()).filter(Boolean)
+      : [])
+];
+
+const corsOptions = {
+  origin(origin, callback) {
+    // Sin Origin (health checks, curl, apps nativas) → permitir.
+    if (!origin) return callback(null, true);
+    if (ORIGENES_PERMITIDOS.includes(origin)) return callback(null, true);
+    // Origin presente pero no permitido → rechazar SIN lanzar excepción
+    // (lanzar tumbaría la request con un 500; mejor un CORS limpio que el
+    // navegador maneja como corresponde).
+    console.warn(`⛔ CORS: origin no permitido → ${origin}`);
+    return callback(null, false);
+  }
+};
+
+app.use(cors(corsOptions));
+
+// Límite de tamaño del body (antes: express.json() sin límite → alguien
+// podía mandar un JSON gigante para consumir memoria). 10kb sobra para el
+// body de /genero, que solo lleva titulo, artista y una lista corta de ids.
+app.use(express.json({ limit: "10kb" }));
+
+// ========================================
+// SEGURIDAD — Rate limiting (ago-2026)
+// Antes: sin ningún límite → un atacante podía mandar miles de peticiones
+// por segundo a /search o /audio (que raspan YouTube por la IP fija de
+// QuotaGuard) o a /genero (que cuesta dinero de la API de Anthropic),
+// agotando cuota, dinero, o tumbando el servicio para los locales reales.
+//
+// CRÍTICO — trust proxy: Render pone el servidor detrás de su balanceador,
+// así que la IP real del cliente llega en el header X-Forwarded-For. Sin
+// esto, express-rate-limit vería a TODOS los clientes como una sola IP (la
+// del proxy) y los contaría juntos → bloquearía a todo el mundo de una vez.
+// Se confía UN SOLO salto de proxy (el de Render), no una cadena arbitraria,
+// que sería falsificable.
+app.set("trust proxy", 1);
+
+// Los límites están calibrados pensando en que un local entero comparte UNA
+// IP (el WiFi del bar): un local lleno con muchas mesas buscando debe pasar
+// sin problema, mientras que un bot que dispara miles de peticiones se corta.
+// El caché de búsquedas hace que el tráfico real a estos endpoints sea aún
+// menor que lo que sugiere el número de clientes.
+
+// Endpoints que raspan YouTube (search, check, audio, duration): generoso
+// para un local en hora pico, pero un techo firme contra abuso.
+const limiteYouTube = rateLimit({
+  windowMs: 60 * 1000,     // ventana de 1 minuto
+  max: 120,                // 120 peticiones/min por IP (2 por segundo sostenido)
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: "Demasiadas peticiones, espera un momento." }
+});
+
+// /genero cuesta dinero real (API de Anthropic) — límite más estricto. Aun
+// así holgado: en un local normal, la mayoría de canciones ni llegan a
+// consultar género (lo resuelve el filtro de palabras o el caché).
+const limiteGenero = rateLimit({
+  windowMs: 60 * 1000,
+  max: 40,                 // 40 verificaciones de género/min por IP
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: "Demasiadas verificaciones de género, espera un momento." }
+});
+
 
 // Headers comunes para simular navegador
 const HEADERS = {
@@ -125,7 +213,7 @@ app.get("/health", (req, res) => {
 // resultado nuevo para la próxima vez (fire-and-forget: no bloquea la
 // respuesta al cliente si Firebase tarda en escribir).
 // ========================================
-app.get("/search", async (req, res) => {
+app.get("/search", limiteYouTube, async (req, res) => {
   const query = req.query.q;
   if (!query) return res.status(400).json({ error: "Falta el parámetro q" });
 
@@ -217,7 +305,7 @@ app.get("/search", async (req, res) => {
 // manda el video por Invidious en lugar de esperar a que YouTube falle
 // visiblemente frente al público.
 // ========================================
-app.get("/check", async (req, res) => {
+app.get("/check", limiteYouTube, async (req, res) => {
   const { videoId } = req.query;
   if (!videoId) return res.status(400).json({ error: "Falta videoId" });
 
@@ -275,7 +363,7 @@ app.get("/check", async (req, res) => {
 // Extrae URL directa del audio desde YouTube
 // sin yt-dlp, usando ytInitialPlayerResponse
 // ========================================
-app.get("/audio", async (req, res) => {
+app.get("/audio", limiteYouTube, async (req, res) => {
   const { videoId } = req.query;
   if (!videoId) return res.status(400).json({ error: "Falta videoId" });
 
@@ -360,7 +448,7 @@ app.get("/audio", async (req, res) => {
 // ========================================
 // GET /duration?videoId=XXX
 // ========================================
-app.get("/duration", async (req, res) => {
+app.get("/duration", limiteYouTube, async (req, res) => {
   const { videoId } = req.query;
   if (!videoId) return res.status(400).json({ error: "Falta videoId" });
 
@@ -470,11 +558,26 @@ async function preguntarleAClaude(prompt, modelo) {
   return (data?.content?.[0]?.text || "").trim();
 }
 
-app.post("/genero", async (req, res) => {
+app.post("/genero", limiteGenero, async (req, res) => {
   const { titulo, artista, generos, segundaOpinion } = req.body || {};
 
   if (!titulo || !Array.isArray(generos) || generos.length === 0) {
     return res.status(400).json({ error: "Faltan datos (titulo, generos)" });
+  }
+
+  // 🛡️ (ago-2026) Validación de forma/tamaño — antes estos valores iban
+  // directo al prompt sin límite: alguien podía mandar un titulo de 2MB para
+  // inflar el costo de tokens o intentar manipular el prompt. Un título y
+  // artista reales de una canción caben de sobra en 300 caracteres, y una
+  // lista de géneros permitidos jamás pasa de unas decenas de ids cortos.
+  if (typeof titulo !== "string" || titulo.length > 300) {
+    return res.status(400).json({ error: "titulo inválido" });
+  }
+  if (artista != null && (typeof artista !== "string" || artista.length > 300)) {
+    return res.status(400).json({ error: "artista inválido" });
+  }
+  if (generos.length > 50 || !generos.every(g => typeof g === "string" && g.length <= 40)) {
+    return res.status(400).json({ error: "generos inválidos" });
   }
 
   console.log(`🎵 /genero: "${titulo}" — "${artista || "?"}" | permitidos: ${generos.join(",")} | segundaOpinion=${!!segundaOpinion}`);
