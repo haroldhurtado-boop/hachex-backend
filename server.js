@@ -5,10 +5,10 @@ const fetch    = require("node-fetch");
 const fs       = require("fs");
 const { HttpsProxyAgent } = require("https-proxy-agent");
 const admin    = require("firebase-admin");
-
+ 
 const app  = express();
 const PORT = process.env.PORT || 3000;
-
+ 
 // ========================================
 // SEGURIDAD — CORS restringido a dominios propios (ago-2026)
 // Antes: app.use(cors()) sin argumentos → el backend respondía a CUALQUIER
@@ -35,7 +35,7 @@ const ORIGENES_PERMITIDOS = [
       ? process.env.CORS_EXTRA_ORIGINS.split(",").map(s => s.trim()).filter(Boolean)
       : [])
 ];
-
+ 
 const corsOptions = {
   origin(origin, callback) {
     // Sin Origin (health checks, curl, apps nativas) → permitir.
@@ -48,14 +48,14 @@ const corsOptions = {
     return callback(null, false);
   }
 };
-
+ 
 app.use(cors(corsOptions));
-
+ 
 // Límite de tamaño del body (antes: express.json() sin límite → alguien
 // podía mandar un JSON gigante para consumir memoria). 10kb sobra para el
 // body de /genero, que solo lleva titulo, artista y una lista corta de ids.
 app.use(express.json({ limit: "10kb" }));
-
+ 
 // ========================================
 // SEGURIDAD — Rate limiting (ago-2026)
 // Antes: sin ningún límite → un atacante podía mandar miles de peticiones
@@ -70,13 +70,13 @@ app.use(express.json({ limit: "10kb" }));
 // Se confía UN SOLO salto de proxy (el de Render), no una cadena arbitraria,
 // que sería falsificable.
 app.set("trust proxy", 1);
-
+ 
 // Los límites están calibrados pensando en que un local entero comparte UNA
 // IP (el WiFi del bar): un local lleno con muchas mesas buscando debe pasar
 // sin problema, mientras que un bot que dispara miles de peticiones se corta.
 // El caché de búsquedas hace que el tráfico real a estos endpoints sea aún
 // menor que lo que sugiere el número de clientes.
-
+ 
 // Endpoints que raspan YouTube (search, check, audio, duration): generoso
 // para un local en hora pico, pero un techo firme contra abuso.
 const limiteYouTube = rateLimit({
@@ -86,7 +86,7 @@ const limiteYouTube = rateLimit({
   legacyHeaders: false,
   message: { error: "Demasiadas peticiones, espera un momento." }
 });
-
+ 
 // /genero cuesta dinero real (API de Anthropic) — límite más estricto. Aun
 // así holgado: en un local normal, la mayoría de canciones ni llegan a
 // consultar género (lo resuelve el filtro de palabras o el caché).
@@ -97,8 +97,8 @@ const limiteGenero = rateLimit({
   legacyHeaders: false,
   message: { error: "Demasiadas verificaciones de género, espera un momento." }
 });
-
-
+ 
+ 
 // 🩹 (ago-2026) HARDENING contra bloqueos de YouTube — incidente del 23 ago
 // donde la IP fija de QuotaGuard fue marcada con captcha (HTTP 429) tras
 // muy poco tráfico. Dos causas probables identificadas: (1) headers
@@ -124,7 +124,7 @@ const HEADERS = {
   "Sec-Fetch-User":           "?1",
   "Upgrade-Insecure-Requests": "1"
 };
-
+ 
 // ── Cookie jar simple para youtube.com ──────────────────────────────────
 // node-fetch no maneja cookies solo — cada petición le llegaba a YouTube
 // como visita nueva, sin ni siquiera la cookie CONSENT que un navegador
@@ -133,7 +133,7 @@ const HEADERS = {
 // Es un jar único compartido (no por usuario) — correcto acá porque quien
 // "navega" es el backend mismo, no cada cliente.
 let cookieJarYouTube = {};
-
+ 
 function leerCookiesDeRespuesta(response) {
   const setCookie = typeof response.headers.raw === "function"
     ? response.headers.raw()["set-cookie"]
@@ -145,13 +145,13 @@ function leerCookiesDeRespuesta(response) {
     if (idx > 0) cookieJarYouTube[par.slice(0, idx).trim()] = par.slice(idx + 1).trim();
   }
 }
-
+ 
 function cookieHeaderActual() {
   const entradas = Object.entries(cookieJarYouTube);
   if (!entradas.length) return null;
   return entradas.map(([k, v]) => `${k}=${v}`).join("; ");
 }
-
+ 
 // ── Circuit breaker (por proxy) ──────────────────────────────────────────
 // Si YouTube empieza a mostrar el challenge de captcha, seguir insistiendo
 // con cada búsqueda nueva no ayuda — puede alargar el bloqueo, y hace que
@@ -166,11 +166,11 @@ function cookieHeaderActual() {
 // por su "etiqueta") tiene su propio reloj de enfriamiento independiente.
 const ENFRIAMIENTO_BLOQUEO_MS = 90 * 1000; // 90s
 const enfriamientoPorProxy = {}; // { etiqueta: timestamp hasta cuándo esperar }
-
+ 
 function esRespuestaDeBloqueo(html, status) {
   return status === 429 || /solveSimpleChallenge|id=.?captcha.?/i.test(html || "");
 }
-
+ 
 function marcarPosibleBloqueo(html, status, etiqueta) {
   if (esRespuestaDeBloqueo(html, status)) {
     enfriamientoPorProxy[etiqueta] = Date.now() + ENFRIAMIENTO_BLOQUEO_MS;
@@ -179,11 +179,11 @@ function marcarPosibleBloqueo(html, status, etiqueta) {
   }
   return false;
 }
-
+ 
 function estaEnEnfriamiento(etiqueta) {
   return Date.now() < (enfriamientoPorProxy[etiqueta] || 0);
 }
-
+ 
 // ========================================
 // QuotaGuard Static IP (ago-2026)
 // Todas las peticiones a YouTube (search, check, audio, duration) salen a
@@ -194,13 +194,13 @@ function estaEnEnfriamiento(etiqueta) {
 // ========================================
 const QUOTAGUARD_URL = process.env.QUOTAGUARDSTATIC_URL || null;
 const proxyAgent = QUOTAGUARD_URL ? new HttpsProxyAgent(QUOTAGUARD_URL) : null;
-
+ 
 if (proxyAgent) {
   console.log("✅ QuotaGuard Static IP activo — peticiones a YouTube saldrán por IP fija");
 } else {
   console.warn("⚠️ QUOTAGUARDSTATIC_URL no configurada — peticiones a YouTube van por IP compartida de Render");
 }
-
+ 
 // ========================================
 // 🩹 (ago-2026) Cascada de respaldo para /search — incidente del 23 ago
 // Orden acordado con Hache, de más barato a más caro:
@@ -219,34 +219,34 @@ if (proxyAgent) {
 // el código simplemente la salta y sigue con la siguiente — igual que ya
 // pasa con QuotaGuard hoy.
 // ========================================
-
+ 
 // ── Capa 2: API oficial de YouTube Data v3 ──
 const YOUTUBE_API_KEY = process.env.YOUTUBE_API_KEY || null;
 const LIMITE_API_DIARIO = 100; // tope real de Google para search.list — no se puede pagar para subirlo
 const cuotaAPI = { fecha: null, usadas: 0 };
-
+ 
 function fechaPacificoHoy() {
   // El cupo de Google resetea a medianoche hora del Pacífico (América/Los_Ángeles),
   // sin importar en qué zona horaria corre Render.
   return new Date().toLocaleDateString("en-US", { timeZone: "America/Los_Angeles" });
 }
-
+ 
 if (YOUTUBE_API_KEY) {
   console.log("✅ API oficial de YouTube configurada — disponible como respaldo (100 búsquedas/día)");
 } else {
   console.warn("⚠️ YOUTUBE_API_KEY no configurada — la capa de respaldo con la API oficial queda desactivada");
 }
-
+ 
 // ── Capa 3: proxy residencial ──
 const RESIDENTIAL_PROXY_URL = process.env.RESIDENTIAL_PROXY_URL || null;
 const residentialProxyAgent = RESIDENTIAL_PROXY_URL ? new HttpsProxyAgent(RESIDENTIAL_PROXY_URL) : null;
-
+ 
 if (residentialProxyAgent) {
   console.log("✅ Proxy residencial configurado — disponible como último respaldo antes de degradar");
 } else {
   console.warn("⚠️ RESIDENTIAL_PROXY_URL no configurada — la capa de respaldo residencial queda desactivada");
 }
-
+ 
 // ── Capa 1: lista rotativa de proxies de centro de datos ──
 // QuotaGuard es el principal (ya pagado, va primero). Cada correo/cuenta
 // nueva que Hache consiga con OTRO proveedor de IP fija se agrega acá sin
@@ -255,7 +255,7 @@ if (residentialProxyAgent) {
 // alguna no está configurada, simplemente no entra en la rotación.
 const proxiesDatacenter = [];
 if (proxyAgent) proxiesDatacenter.push({ agente: proxyAgent, etiqueta: "quotaguard" });
-
+ 
 // 🩹 (ago-2026 v3) Sin tope fijo — Hache decidió no limitar cuántas IPs de
 // respaldo puede tener (empieza con 10 dedicadas de Webshare, pero puede
 // crecer). En vez de una lista fija [2,3,4,5], recorre hasta 20 posiciones
@@ -269,9 +269,9 @@ for (let n = 2; n <= 20; n++) {
     console.log(`✅ Proxy de respaldo #${n} configurado (PROXY_RESPALDO_${n}_URL) — ${n}º en la rotación`);
   }
 }
-
+ 
 console.log(`✅ ${proxiesDatacenter.length} proxy(s) de centro de datos en rotación para /search`);
-
+ 
 // ========================================
 // Firebase Admin — caché de búsquedas (ago-2026)
 // Antes de raspar YouTube en /search, se consulta si esa misma búsqueda ya
@@ -288,7 +288,7 @@ console.log(`✅ ${proxiesDatacenter.length} proxy(s) de centro de datos en rota
 // ========================================
 const SERVICE_ACCOUNT_PATH = "/etc/secrets/firebase-service-account.json";
 const CACHE_TTL_MS = 15 * 24 * 60 * 60 * 1000; // 15 días
-
+ 
 // 🎯 (ago-2026) TTL corto para búsquedas que dieron 0 resultados. Se cachean
 // igual que cualquier búsqueda real (evita que un typo o una canción rara se
 // re-busque en YouTube cada vez que alguien la repite), pero con vida corta:
@@ -297,7 +297,7 @@ const CACHE_TTL_MS = 15 * 24 * 60 * 60 * 1000; // 15 días
 // que la canción no exista. 15 días sería demasiado tiempo para dejar una
 // búsqueda posiblemente válida marcada como "sin resultados".
 const CACHE_TTL_VACIO_MS = 6 * 60 * 60 * 1000; // 6 horas
-
+ 
 // 🎯 (ago-2026) Guarda en caché CON reintento — antes era fire-and-forget
 // con un solo intento: si esa escritura a Firebase fallaba (blip de red,
 // lo que sea), la búsqueda se le servía bien al cliente pero JAMÁS quedaba
@@ -317,9 +317,9 @@ async function guardarEnCacheConReintento(cacheRef, datos, intento = 1) {
     console.error(`⚠️ Fallo guardando en caché tras 2 intentos — esta búsqueda NO quedó cacheada: ${err.message}`);
   }
 }
-
+ 
 let db = null;
-
+ 
 if (fs.existsSync(SERVICE_ACCOUNT_PATH)) {
   try {
     const serviceAccount = require(SERVICE_ACCOUNT_PATH);
@@ -335,7 +335,7 @@ if (fs.existsSync(SERVICE_ACCOUNT_PATH)) {
 } else {
   console.warn("⚠️ firebase-service-account.json no encontrado — caché de búsquedas desactivado, todo va directo a YouTube");
 }
-
+ 
 // ========================================
 // Convierte el texto de búsqueda en una clave estable de caché para Firebase.
 // ========================================
@@ -351,7 +351,7 @@ function normalizarClaveCache(query) {
   const palabras = norm.split(" ").filter(w => w.length > 0).sort();
   return palabras.join("_").substring(0, 200);
 }
-
+ 
 // ========================================
 // Helper: fetch con timeout — evita que requests colgadas se acumulen en
 // memoria hasta tumbar la instancia (causa confirmada de "Ran out of memory").
@@ -390,7 +390,7 @@ async function fetchConTimeout(url, options = {}, timeoutMs = 8000, viaProxy = t
     clearTimeout(t);
   }
 }
-
+ 
 // ========================================
 // GET /health
 // ========================================
@@ -405,7 +405,35 @@ app.get("/health", (req, res) => {
     cache: !!db
   });
 });
-
+ 
+// ========================================
+// GET /estado-proxies
+// 🩹 (ago-2026) Pedido de Hache: panel de admin que muestra cuántas IPs
+// están disponibles AHORA MISMO (ninguna en enfriamiento) vs cuántas están
+// pausadas por un bloqueo reciente. Es estado en vivo del proceso (vive en
+// memoria, no en Firebase) — por eso es un endpoint aparte, no un dato que
+// se pueda leer directo desde admin.html.
+// ========================================
+app.get("/estado-proxies", (req, res) => {
+  const proxies = proxiesDatacenter.map(p => ({
+    etiqueta: p.etiqueta,
+    disponible: !estaEnEnfriamiento(p.etiqueta)
+  }));
+ 
+  const hoy = fechaPacificoHoy();
+  const apiUsadasHoy = (cuotaAPI.fecha === hoy) ? cuotaAPI.usadas : 0;
+ 
+  res.json({
+    proxies,
+    totalProxies: proxies.length,
+    disponiblesAhora: proxies.filter(p => p.disponible).length,
+    apiOficial: YOUTUBE_API_KEY
+      ? { usadasHoy: apiUsadasHoy, limite: LIMITE_API_DIARIO, disponible: apiUsadasHoy < LIMITE_API_DIARIO }
+      : null,
+    proxyResidencial: !!residentialProxyAgent
+  });
+});
+ 
 // ========================================
 // Scraping de /results — función compartida entre TODOS los proxies de la
 // cascada (capa 1: cada uno de proxiesDatacenter; capa 3: residencial).
@@ -424,11 +452,11 @@ async function intentarScrapeYouTube(query, agente, etiqueta) {
       marcarPosibleBloqueo(html, response.status, etiqueta);
       return null;
     }
-
+ 
     const data     = JSON.parse(match[1]);
     const contents = data?.contents?.twoColumnSearchResultsRenderer?.primaryContents
       ?.sectionListRenderer?.contents?.[0]?.itemSectionRenderer?.contents || [];
-
+ 
     const videos = contents
       .filter(c => c.videoRenderer)
       .slice(0, 20)
@@ -442,7 +470,7 @@ async function intentarScrapeYouTube(query, agente, etiqueta) {
           duration:  v.lengthText?.simpleText || ""
         };
       });
-
+ 
     console.log(`✅ /search (${etiqueta}): "${query}" — ${videos.length} resultados`);
     return videos;
   } catch (err) {
@@ -450,7 +478,7 @@ async function intentarScrapeYouTube(query, agente, etiqueta) {
     return null;
   }
 }
-
+ 
 // ========================================
 // Capa 2: API oficial de YouTube Data v3 — respaldo gratuito de UNA sola
 // cuenta, respetando su tope real de 100 búsquedas/día (ver comentario
@@ -459,26 +487,26 @@ async function intentarScrapeYouTube(query, agente, etiqueta) {
 // ========================================
 async function buscarViaAPIOficial(query) {
   if (!YOUTUBE_API_KEY) return null;
-
+ 
   const hoy = fechaPacificoHoy();
   if (cuotaAPI.fecha !== hoy) { cuotaAPI.fecha = hoy; cuotaAPI.usadas = 0; }
-
+ 
   if (cuotaAPI.usadas >= LIMITE_API_DIARIO) {
     console.warn(`⚠️ /search: cuota diaria de la API oficial agotada (${LIMITE_API_DIARIO}/día) — saltando a la siguiente capa`);
     return null;
   }
-
+ 
   try {
     const url = `https://www.googleapis.com/youtube/v3/search?part=snippet&type=video&maxResults=20&q=${encodeURIComponent(query)}&key=${YOUTUBE_API_KEY}`;
     const res = await fetchConTimeout(url, {}, 8000, false);
     cuotaAPI.usadas++; // se cuenta el intento, tenga éxito o no — así lo cobra Google
-
+ 
     if (!res.ok) {
       const cuerpo = await res.text().catch(() => "");
       console.warn(`⚠️ /search (api_oficial): status ${res.status} — ${cuerpo.slice(0, 200)}`);
       return null;
     }
-
+ 
     const data = await res.json();
     const videos = (data.items || [])
       .filter(it => it.id?.videoId)
@@ -489,7 +517,7 @@ async function buscarViaAPIOficial(query) {
         thumbnail: it.snippet?.thumbnails?.high?.url || it.snippet?.thumbnails?.default?.url || "",
         duration:  "" // search.list no trae duración; pedirla aparte costaría cuota extra
       }));
-
+ 
     console.log(`✅ /search (api_oficial): "${query}" — ${videos.length} resultados (${cuotaAPI.usadas}/${LIMITE_API_DIARIO} hoy)`);
     return videos;
   } catch (err) {
@@ -497,17 +525,17 @@ async function buscarViaAPIOficial(query) {
     return null;
   }
 }
-
+ 
 // ========================================
 // GET /search?q=nombre+artista
 // ========================================
 app.get("/search", limiteYouTube, async (req, res) => {
   const query = req.query.q;
   if (!query) return res.status(400).json({ error: "Falta el parámetro q" });
-
+ 
   const clave = normalizarClaveCache(query);
   const cacheRef = db ? db.ref(`cacheBusquedas/${clave}`) : null;
-
+ 
   try {
     // ── Intentar servir desde caché ──
     if (cacheRef) {
@@ -528,7 +556,7 @@ app.get("/search", limiteYouTube, async (req, res) => {
         console.error("⚠️ Error leyendo caché, se sigue con YouTube directo:", err.message);
       }
     }
-
+ 
     // ── No hay caché válido: cascada de respaldo ──
     // 🩹 (ago-2026 v2) Orden acordado con Hache — de más barato a más caro:
     //   1. proxiesDatacenter (QuotaGuard + respaldos de otros proveedores),
@@ -538,7 +566,7 @@ app.get("/search", limiteYouTube, async (req, res) => {
     //   4. Nada funcionó → degradar con el aviso de "intenta en un momento".
     let videos = null;
     let fuente = null;
-
+ 
     for (const { agente, etiqueta } of proxiesDatacenter) {
       if (estaEnEnfriamiento(etiqueta)) {
         console.warn(`🚫 /search: "${query}" — proxy "${etiqueta}" en enfriamiento, probando el siguiente`);
@@ -547,41 +575,63 @@ app.get("/search", limiteYouTube, async (req, res) => {
       videos = await intentarScrapeYouTube(query, agente, etiqueta);
       if (videos) { fuente = etiqueta; break; }
     }
-
+ 
     if (!videos) {
       videos = await buscarViaAPIOficial(query);
       if (videos) fuente = "api_oficial";
     }
-
+ 
     if (!videos && residentialProxyAgent) {
       videos = await intentarScrapeYouTube(query, residentialProxyAgent, "residencial");
       if (videos) fuente = "residencial";
     }
-
+ 
     if (!videos) {
       return res.status(503).json({ error: "YouTube está limitando peticiones temporalmente, reintenta en un momento", enfriamiento: true });
     }
-
+ 
     if (cacheRef) {
       const datos = { query, videos, timestamp: Date.now() };
       if (videos.length === 0) datos.vacio = true;
       guardarEnCacheConReintento(cacheRef, datos);
     }
-
+ 
+    // 🩹 (ago-2026) Registro para el panel de admin — dos cosas pedidas por
+    // Hache que antes no se guardaban en ningún lado:
+    //   1. busquedasEnVivo/{clave}: qué búsquedas tuvieron que tocar YouTube
+    //      de verdad (no venían de caché) — el panel "Búsquedas nuevas" de
+    //      admin.html estaba vacío porque este dato nunca se escribía.
+    //   2. estadisticasProxy/{fuente}: cuántas veces se usó cada IP/API hoy
+    //      y cuándo fue la última vez — para el panel nuevo de "IPs en uso".
+    // Ambas son fire-and-forget (no bloquean la respuesta al cliente) y
+    // usan la misma "clave" normalizada que ya existe para el caché, así
+    // que no crecen sin límite: una búsqueda repetida actualiza su propia
+    // entrada en vez de crear una nueva cada vez.
+    if (db && fuente) {
+      db.ref(`busquedasEnVivo/${clave}`).set({ query, fuente, timestamp: Date.now() })
+        .catch(err => console.error("⚠️ Error registrando búsqueda en vivo:", err.message));
+      db.ref(`estadisticasProxy/${fuente}`).transaction(actual => {
+        actual = actual || { usos: 0 };
+        actual.usos = (actual.usos || 0) + 1;
+        actual.ultimoUso = Date.now();
+        return actual;
+      }).catch(err => console.error("⚠️ Error registrando estadística de proxy:", err.message));
+    }
+ 
     res.json({ videos, cache: false, fuente });
   } catch (err) {
     console.error("Error en /search:", err.message);
     res.status(500).json({ error: "Error interno del servidor" });
   }
 });
-
+ 
 // ========================================
 // GET /check?videoId=XXX
 // ========================================
 app.get("/check", limiteYouTube, async (req, res) => {
   const { videoId } = req.query;
   if (!videoId) return res.status(400).json({ error: "Falta videoId" });
-
+ 
   try {
     const innertubeRes = await fetchConTimeout(
       "https://www.youtube.com/youtubei/v1/player?key=AIzaSyAO_FJ2SlqU8Q4STEHLGCilw_Y9_11qcW8",
@@ -607,31 +657,31 @@ app.get("/check", limiteYouTube, async (req, res) => {
       },
       5000
     );
-
+ 
     const playerData = await innertubeRes.json();
     const status = playerData?.playabilityStatus?.status;
-
+ 
     if (status === "ERROR" || status === "LOGIN_REQUIRED" || status === "UNPLAYABLE") {
       return res.json({ embeddable: false, reason: status });
     }
-
+ 
     const playableInEmbed = playerData?.playabilityStatus?.playableInEmbed;
     const embeddable = playableInEmbed !== false;
-
+ 
     res.json({ embeddable, reason: embeddable ? null : "EMBED_RESTRICTED" });
   } catch (err) {
     console.error("Error en /check:", err.message);
     res.status(500).json({ error: "Error interno del servidor", embeddable: true });
   }
 });
-
+ 
 // ========================================
 // GET /audio?videoId=XXX
 // ========================================
 app.get("/audio", limiteYouTube, async (req, res) => {
   const { videoId } = req.query;
   if (!videoId) return res.status(400).json({ error: "Falta videoId" });
-
+ 
   try {
     const innertubeRes = await fetchConTimeout("https://www.youtube.com/youtubei/v1/player?key=AIzaSyAO_FJ2SlqU8Q4STEHLGCilw_Y9_11qcW8", {
       method: "POST",
@@ -654,19 +704,19 @@ app.get("/audio", limiteYouTube, async (req, res) => {
         }
       })
     });
-
+ 
     const playerData = await innertubeRes.json();
-
+ 
     const status = playerData?.playabilityStatus?.status;
     if (status === "ERROR" || status === "LOGIN_REQUIRED" || status === "UNPLAYABLE") {
       console.warn(`⚠️ Video no disponible: ${videoId} — status: ${status}`);
       return res.status(403).json({ error: "Video no disponible", status });
     }
-
+ 
     const audioFormats = (playerData?.streamingData?.adaptiveFormats || [])
       .filter(f => f.mimeType && f.mimeType.startsWith("audio/") && f.url)
       .sort((a, b) => (b.bitrate || 0) - (a.bitrate || 0));
-
+ 
     if (audioFormats.length > 0) {
       const best = audioFormats[0];
       const duration = parseInt(playerData?.videoDetails?.lengthSeconds || 0);
@@ -680,7 +730,7 @@ app.get("/audio", limiteYouTube, async (req, res) => {
         title
       });
     }
-
+ 
     console.log("⚠️ Innertube no dio formatos, intentando scraping...");
     const pageRes  = await fetchConTimeout(`https://www.youtube.com/watch?v=${videoId}`, { headers: HEADERS });
     const html     = await pageRes.text();
@@ -689,46 +739,46 @@ app.get("/audio", limiteYouTube, async (req, res) => {
     marcarPosibleBloqueo(html, pageRes.status, "quotaguard");
     const prMatch  = html.match(/ytInitialPlayerResponse\s*=\s*({.+?})\s*;/s);
     if (!prMatch) return res.status(500).json({ error: "No se pudo extraer player response" });
-
+ 
     const pr = JSON.parse(prMatch[1]);
     const formats2 = (pr?.streamingData?.adaptiveFormats || [])
       .filter(f => f.mimeType && f.mimeType.startsWith("audio/") && f.url)
       .sort((a, b) => (b.bitrate || 0) - (a.bitrate || 0));
-
+ 
     if (formats2.length > 0) {
       const best2    = formats2[0];
       const duration2 = parseInt(pr?.videoDetails?.lengthSeconds || 0);
       return res.json({ url: best2.url, mimeType: best2.mimeType, bitrate: best2.bitrate, duration: duration2 });
     }
-
+ 
     return res.status(404).json({ error: "No se encontraron formatos de audio" });
-
+ 
   } catch(e) {
     console.error("Error /audio:", e.message);
     res.status(500).json({ error: "Error interno", detail: e.message });
   }
 });
-
+ 
 // ========================================
 // GET /duration?videoId=XXX
 // ========================================
 app.get("/duration", limiteYouTube, async (req, res) => {
   const { videoId } = req.query;
   if (!videoId) return res.status(400).json({ error: "Falta videoId" });
-
+ 
   // 🩹 (ago-2026) Mismo circuit breaker que /search — usa la etiqueta del
   // proxy principal, ya que /duration solo pasa por QuotaGuard, no por toda
   // la cascada de respaldo (esa es específica de /search).
   if (estaEnEnfriamiento("quotaguard")) {
     return res.status(503).json({ error: "YouTube está limitando peticiones temporalmente, reintenta en un momento", enfriamiento: true });
   }
-
+ 
   try {
     const url      = `https://www.youtube.com/watch?v=${videoId}`;
     const response = await fetchConTimeout(url, { headers: HEADERS });
     const html     = await response.text();
     marcarPosibleBloqueo(html, response.status, "quotaguard");
-
+ 
     const patterns = [/"lengthSeconds":"(\d+)"/, /"lengthSeconds":(\d+)/, /lengthSeconds\\?":\\?"(\d+)/];
     for (const pattern of patterns) {
       const match = html.match(pattern);
@@ -737,7 +787,7 @@ app.get("/duration", limiteYouTube, async (req, res) => {
         if (duration > 0) return res.json({ duration });
       }
     }
-
+ 
     const prMatch = html.match(/ytInitialPlayerResponse\s*=\s*({.+?})\s*;/s);
     if (prMatch) {
       try {
@@ -746,30 +796,30 @@ app.get("/duration", limiteYouTube, async (req, res) => {
         if (dur) return res.json({ duration: parseInt(dur) });
       } catch(e) {}
     }
-
+ 
     res.status(404).json({ error: "No se encontró duración" });
   } catch(e) {
     res.status(500).json({ error: "Error interno" });
   }
 });
-
+ 
 // ========================================
 // POST /genero
 // ========================================
 const ANTHROPIC_TIMEOUT_MS = 4000;
-
+ 
 function construirPromptGenero(titulo, artista, listaGeneros) {
   return `Cancion: "${titulo}"${artista ? ` — Artista/canal: "${artista}"` : ""}
-
+ 
 Generos permitidos hoy: ${listaGeneros}
-
+ 
 Responde EXCLUSIVAMENTE con el id exacto de UNO de los generos permitidos de la lista de arriba si la cancion pertenece claramente a ese genero — aqui si reconoces la cancion o el artista, aunque sea parcialmente o por un nombre de canal poco claro, responde con tu mejor clasificacion en vez de dudar.
-
+ 
 NO_COINCIDE es una decision seria: bloquea a un cliente real de un bar en el momento en que esta pidiendo su cancion. Uselo UNICAMENTE cuando esta SEGURO de cual es el genero real de la cancion Y ese genero claramente no es ninguno de los permitidos (ej: reconoce que es reggaeton y reggaeton no esta en la lista). Si el artista le resulta poco conocido, no esta seguro de su genero exacto, o solo tiene una sospecha sin certeza real, NO use NO_COINCIDE — responda INSEGURO en su lugar. Ante cualquier duda genuina sobre el genero real de la cancion, la respuesta correcta es INSEGURO, nunca NO_COINCIDE.
-
+ 
 No agregues explicaciones ni texto adicional — responde solo esa palabra, nada mas.`;
 }
-
+ 
 async function preguntarleAClaude(prompt, modelo) {
   const aiRes = await fetchConTimeout(
     "https://api.anthropic.com/v1/messages",
@@ -789,24 +839,24 @@ async function preguntarleAClaude(prompt, modelo) {
     ANTHROPIC_TIMEOUT_MS,
     false
   );
-
+ 
   if (!aiRes.ok) {
     const cuerpoError = await aiRes.text().catch(() => "(no se pudo leer el cuerpo)");
     console.error(`⚠️ /genero (${modelo}): Anthropic respondió status ${aiRes.status} — ${cuerpoError}`);
     return null;
   }
-
+ 
   const data = await aiRes.json();
   return (data?.content?.[0]?.text || "").trim();
 }
-
+ 
 app.post("/genero", limiteGenero, async (req, res) => {
   const { titulo, artista, generos, segundaOpinion } = req.body || {};
-
+ 
   if (!titulo || !Array.isArray(generos) || generos.length === 0) {
     return res.status(400).json({ error: "Faltan datos (titulo, generos)" });
   }
-
+ 
   if (typeof titulo !== "string" || titulo.length > 300) {
     return res.status(400).json({ error: "titulo inválido" });
   }
@@ -816,23 +866,23 @@ app.post("/genero", limiteGenero, async (req, res) => {
   if (generos.length > 50 || !generos.every(g => typeof g === "string" && g.length <= 40)) {
     return res.status(400).json({ error: "generos inválidos" });
   }
-
+ 
   console.log(`🎵 /genero: "${titulo}" — "${artista || "?"}" | permitidos: ${generos.join(",")} | segundaOpinion=${!!segundaOpinion}`);
-
+ 
   if (!process.env.ANTHROPIC_API_KEY) {
     console.warn("⚠️ ANTHROPIC_API_KEY no configurada — /genero responde sin verificar");
     return res.json({ genero: null });
   }
-
+ 
   const listaGeneros = generos.join(", ");
   const prompt = construirPromptGenero(titulo, artista, listaGeneros);
-
+ 
   try {
     let texto = await preguntarleAClaude(prompt, "claude-haiku-4-5-20251001");
     if (texto === null) return res.json({ genero: null });
-
+ 
     console.log(`🎵 /genero: "${titulo}" → Haiku respondió "${texto}"`);
-
+ 
     const haikuBloquearia = texto === "NO_COINCIDE" || !generos.includes(texto);
     if (haikuBloquearia && segundaOpinion === true) {
       const textoSonnet = await preguntarleAClaude(prompt, "claude-sonnet-5");
@@ -841,21 +891,21 @@ app.post("/genero", limiteGenero, async (req, res) => {
         texto = textoSonnet;
       }
     }
-
+ 
     if (texto === "NO_COINCIDE") return res.json({ genero: "NO_COINCIDE" });
     if (!generos.includes(texto)) {
       if (texto !== "INSEGURO") console.warn(`⚠️ /genero: respuesta inesperada ("${texto}"), tratando como insegura`);
       return res.json({ genero: null });
     }
-
+ 
     return res.json({ genero: texto });
-
+ 
   } catch (err) {
     console.error(`Error en /genero ("${titulo}"):`, err.message);
     return res.json({ genero: null });
   }
 });
-
+ 
 app.listen(PORT, () => {
   console.log(`✅ Hache X Backend corriendo en puerto ${PORT}`);
 });
