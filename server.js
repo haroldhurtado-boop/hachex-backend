@@ -99,12 +99,90 @@ const limiteGenero = rateLimit({
 });
 
 
-// Headers comunes para simular navegador
+// 🩹 (ago-2026) HARDENING contra bloqueos de YouTube — incidente del 23 ago
+// donde la IP fija de QuotaGuard fue marcada con captcha (HTTP 429) tras
+// muy poco tráfico. Dos causas probables identificadas: (1) headers
+// demasiado escuetos/siempre idénticos, sin las cookies que un navegador
+// real acumula — huella fácil de distinguir de tráfico humano aunque la IP
+// sea limpia; (2) posible reputación previa de la IP compartida por
+// QuotaGuard en planes no-dedicados (a confirmar con su soporte). Esto
+// ataca la causa (1), que es la única que el código puede controlar.
+//
+// Headers ampliados — antes solo tenían 3 campos, siempre idénticos en cada
+// petición; un navegador real manda muchos más y varían por request.
 const HEADERS = {
-  "User-Agent":      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36",
-  "Accept-Language": "es-ES,es;q=0.9",
-  "Accept":          "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
+  "User-Agent":               "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+  "Accept-Language":          "es-ES,es;q=0.9,en;q=0.8",
+  "Accept":                   "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+  "Accept-Encoding":          "gzip, deflate, br",
+  "sec-ch-ua":                '"Not_A Brand";v="8", "Chromium";v="120", "Google Chrome";v="120"',
+  "sec-ch-ua-mobile":         "?0",
+  "sec-ch-ua-platform":       '"Windows"',
+  "Sec-Fetch-Dest":           "document",
+  "Sec-Fetch-Mode":           "navigate",
+  "Sec-Fetch-Site":           "none",
+  "Sec-Fetch-User":           "?1",
+  "Upgrade-Insecure-Requests": "1"
 };
+
+// ── Cookie jar simple para youtube.com ──────────────────────────────────
+// node-fetch no maneja cookies solo — cada petición le llegaba a YouTube
+// como visita nueva, sin ni siquiera la cookie CONSENT que un navegador
+// real junta desde la primera visita. Esto guarda las cookies que YouTube
+// devuelve y las reenvía en la siguiente petición, como haría un navegador.
+// Es un jar único compartido (no por usuario) — correcto acá porque quien
+// "navega" es el backend mismo, no cada cliente.
+let cookieJarYouTube = {};
+
+function leerCookiesDeRespuesta(response) {
+  const setCookie = typeof response.headers.raw === "function"
+    ? response.headers.raw()["set-cookie"]
+    : null;
+  if (!setCookie) return;
+  for (const linea of setCookie) {
+    const [par] = linea.split(";");
+    const idx = par.indexOf("=");
+    if (idx > 0) cookieJarYouTube[par.slice(0, idx).trim()] = par.slice(idx + 1).trim();
+  }
+}
+
+function cookieHeaderActual() {
+  const entradas = Object.entries(cookieJarYouTube);
+  if (!entradas.length) return null;
+  return entradas.map(([k, v]) => `${k}=${v}`).join("; ");
+}
+
+// ── Circuit breaker (por proxy) ──────────────────────────────────────────
+// Si YouTube empieza a mostrar el challenge de captcha, seguir insistiendo
+// con cada búsqueda nueva no ayuda — puede alargar el bloqueo, y hace que
+// cada cliente del bar dispare su propio intento fallido con el timeout
+// completo (8s) en vez de fallar rápido. Al detectar el patrón, se deja de
+// tocar YouTube por un rato y se responde rápido con el mismo motivo, hasta
+// que se cumpla el enfriamiento — momento en que se reintenta solo.
+//
+// 🩹 (ago-2026 v2) Ahora es POR PROXY, no un único estado global — con
+// varias IPs de respaldo en rotación (ver más abajo), que UNA esté en
+// enfriamiento no debe impedir probar las otras. Cada proxy (identificado
+// por su "etiqueta") tiene su propio reloj de enfriamiento independiente.
+const ENFRIAMIENTO_BLOQUEO_MS = 90 * 1000; // 90s
+const enfriamientoPorProxy = {}; // { etiqueta: timestamp hasta cuándo esperar }
+
+function esRespuestaDeBloqueo(html, status) {
+  return status === 429 || /solveSimpleChallenge|id=.?captcha.?/i.test(html || "");
+}
+
+function marcarPosibleBloqueo(html, status, etiqueta) {
+  if (esRespuestaDeBloqueo(html, status)) {
+    enfriamientoPorProxy[etiqueta] = Date.now() + ENFRIAMIENTO_BLOQUEO_MS;
+    console.warn(`🚫 Patrón de bloqueo detectado en proxy "${etiqueta}" (status ${status}) — pausándolo ${ENFRIAMIENTO_BLOQUEO_MS / 1000}s`);
+    return true;
+  }
+  return false;
+}
+
+function estaEnEnfriamiento(etiqueta) {
+  return Date.now() < (enfriamientoPorProxy[etiqueta] || 0);
+}
 
 // ========================================
 // QuotaGuard Static IP (ago-2026)
@@ -122,6 +200,77 @@ if (proxyAgent) {
 } else {
   console.warn("⚠️ QUOTAGUARDSTATIC_URL no configurada — peticiones a YouTube van por IP compartida de Render");
 }
+
+// ========================================
+// 🩹 (ago-2026) Cascada de respaldo para /search — incidente del 23 ago
+// Orden acordado con Hache, de más barato a más caro:
+//   1. QuotaGuard (tarifa fija ya pagada) — intento normal de siempre.
+//   2. API oficial de YouTube Data v3 (gratis, pero tope duro de 100
+//      búsquedas/día — UNA sola cuenta, nunca varias: usar más de un
+//      proyecto de Google Cloud para multiplicar esa cuota se llama
+//      "sharding" y está explícitamente prohibido por los Términos de
+//      Servicio de la API de YouTube — puede tumbar todos los proyectos,
+//      no solo el de respaldo).
+//   3. Proxy residencial (cobra por GB — el más caro, por eso va de último
+//      entre los que SÍ intentan resolver la búsqueda).
+//   4. Nada funcionó → degradar con el aviso de "intenta en un momento"
+//      que ya existía (circuit breaker).
+// Cada capa es opcional: si su variable de entorno no está configurada,
+// el código simplemente la salta y sigue con la siguiente — igual que ya
+// pasa con QuotaGuard hoy.
+// ========================================
+
+// ── Capa 2: API oficial de YouTube Data v3 ──
+const YOUTUBE_API_KEY = process.env.YOUTUBE_API_KEY || null;
+const LIMITE_API_DIARIO = 100; // tope real de Google para search.list — no se puede pagar para subirlo
+const cuotaAPI = { fecha: null, usadas: 0 };
+
+function fechaPacificoHoy() {
+  // El cupo de Google resetea a medianoche hora del Pacífico (América/Los_Ángeles),
+  // sin importar en qué zona horaria corre Render.
+  return new Date().toLocaleDateString("en-US", { timeZone: "America/Los_Angeles" });
+}
+
+if (YOUTUBE_API_KEY) {
+  console.log("✅ API oficial de YouTube configurada — disponible como respaldo (100 búsquedas/día)");
+} else {
+  console.warn("⚠️ YOUTUBE_API_KEY no configurada — la capa de respaldo con la API oficial queda desactivada");
+}
+
+// ── Capa 3: proxy residencial ──
+const RESIDENTIAL_PROXY_URL = process.env.RESIDENTIAL_PROXY_URL || null;
+const residentialProxyAgent = RESIDENTIAL_PROXY_URL ? new HttpsProxyAgent(RESIDENTIAL_PROXY_URL) : null;
+
+if (residentialProxyAgent) {
+  console.log("✅ Proxy residencial configurado — disponible como último respaldo antes de degradar");
+} else {
+  console.warn("⚠️ RESIDENTIAL_PROXY_URL no configurada — la capa de respaldo residencial queda desactivada");
+}
+
+// ── Capa 1: lista rotativa de proxies de centro de datos ──
+// QuotaGuard es el principal (ya pagado, va primero). Cada correo/cuenta
+// nueva que Hache consiga con OTRO proveedor de IP fija se agrega acá sin
+// tocar el resto del código — solo definiendo su variable de entorno
+// correspondiente en Render (PROXY_RESPALDO_2_URL, _3_URL, _4_URL, _5_URL). Si
+// alguna no está configurada, simplemente no entra en la rotación.
+const proxiesDatacenter = [];
+if (proxyAgent) proxiesDatacenter.push({ agente: proxyAgent, etiqueta: "quotaguard" });
+
+// 🩹 (ago-2026 v3) Sin tope fijo — Hache decidió no limitar cuántas IPs de
+// respaldo puede tener (empieza con 10 dedicadas de Webshare, pero puede
+// crecer). En vez de una lista fija [2,3,4,5], recorre hasta 20 posiciones
+// — las que no tengan variable configurada simplemente no entran a la
+// rotación, así que agregar la 6ª, 7ª... IP en el futuro es solo pegar su
+// URL en Render, cero cambios de código.
+for (let n = 2; n <= 20; n++) {
+  const url = process.env[`PROXY_RESPALDO_${n}_URL`];
+  if (url) {
+    proxiesDatacenter.push({ agente: new HttpsProxyAgent(url), etiqueta: `respaldo_${n}` });
+    console.log(`✅ Proxy de respaldo #${n} configurado (PROXY_RESPALDO_${n}_URL) — ${n}º en la rotación`);
+  }
+}
+
+console.log(`✅ ${proxiesDatacenter.length} proxy(s) de centro de datos en rotación para /search`);
 
 // ========================================
 // Firebase Admin — caché de búsquedas (ago-2026)
@@ -189,41 +338,6 @@ if (fs.existsSync(SERVICE_ACCOUNT_PATH)) {
 
 // ========================================
 // Convierte el texto de búsqueda en una clave estable de caché para Firebase.
-//
-// 🎯 (ago-2026) OBJETIVO: exprimir al máximo cacheBusquedas para pegarle lo
-// MENOS posible a YouTube (evitar el bloqueo de IP). La versión anterior solo
-// bajaba a minúsculas y cambiaba espacios por "_", así que la MISMA canción
-// escrita distinto generaba entradas SEPARADAS — y cada una raspaba YouTube
-// por su lado:
-//   "Bad Bunny - Diles", "bad bunny diles", "diles bad bunny", "Bad Bunny,
-//    Diles"  →  4 entradas distintas  →  4 llamadas a YouTube para lo mismo.
-//
-// Esta versión las unifica en UNA sola clave, reduciendo ~25-40% las llamadas
-// a YouTube (medido sobre formas reales de escribir en un bar). Pasos:
-//   1. minúsculas
-//   2. quitar acentos y diacríticos (así→asi, niño→nino)
-//   3. ELIMINAR apóstrofes/comillas sin dejar espacio (don't→dont, no "don t")
-//   4. todo OTRO signo (guion, coma, /, etc.) → espacio
-//   5. colapsar espacios
-//   6. ordenar las palabras alfabéticamente → "diles bad bunny" == "bad bunny
-//      diles" (YouTube titula la misma canción en cualquier orden según el canal)
-//
-// PRINCIPIO DE DISEÑO — PRECISIÓN SOBRE COBERTURA: es CONSERVADORA a propósito.
-// Solo elimina lo que es inequívocamente ruido (acentos, signos, mayúsculas,
-// orden). NO toca palabras de relleno ("y", "and", "de", "the", "remix",
-// números de versión, "en vivo"...) — hacerlo captaría un puñado de casos
-// raros más, pero al precio de arriesgar FUSIONAR canciones distintas ("la
-// bicicleta" vs "la bicicleta en vivo", "rocky 1" vs "rocky 2"), que serviría
-// la canción equivocada a un cliente real. Un caché que jamás confunde dos
-// canciones vale más que uno que ahorra un 2% extra equivocándose a veces.
-//
-// COMPATIBILIDAD: la clave es SOLO el índice interno en Firebase. Los "videos"
-// devueltos son siempre los resultados reales de esa búsqueda — el usuario ve
-// lo mismo de siempre. Al desplegar, las entradas viejas (formato anterior)
-// quedan huérfanas y vencen solas por TTL; durante los primeros días cada
-// canción se re-buscará UNA vez en YouTube para repoblarse con la clave nueva
-// (pico transitorio único, sin errores ni pantallas rotas). Firebase no admite
-// ".", "#", "$", "[", "]", "/" en las claves — el paso 4 los elimina todos.
 // ========================================
 function normalizarClaveCache(query) {
   const norm = (query == null ? "" : String(query))
@@ -247,15 +361,31 @@ function normalizarClaveCache(query) {
 // por esa IP fija. Pasar viaProxy:false para las que NO son a YouTube (ej.
 // la llamada a la API de Anthropic en /genero).
 // ========================================
-async function fetchConTimeout(url, options = {}, timeoutMs = 8000, viaProxy = true) {
+async function fetchConTimeout(url, options = {}, timeoutMs = 8000, viaProxy = true, agenteOverride = null) {
   const ctrl = new AbortController();
   const t = setTimeout(() => ctrl.abort(), timeoutMs);
   try {
     const finalOptions = { ...options, signal: ctrl.signal };
-    if (viaProxy && proxyAgent) {
-      finalOptions.agent = proxyAgent;
+    // 🩹 (ago-2026 v2) agenteOverride permite forzar un proxy específico de
+    // la rotación (ver proxiesDatacenter / residentialProxyAgent) en vez de
+    // siempre usar el de QuotaGuard por defecto — necesario para la cascada
+    // de respaldo de /search.
+    const agente = agenteOverride || (viaProxy ? proxyAgent : null);
+    if (agente) {
+      finalOptions.agent = agente;
     }
-    return await fetch(url, finalOptions);
+    // 🩹 (ago-2026) Reenviar las cookies acumuladas de YouTube — ver cookie
+    // jar más arriba. Solo aplica a peticiones a youtube.com (no a Anthropic).
+    const esYoutube = url.includes("youtube.com");
+    if (esYoutube) {
+      const cookieHeader = cookieHeaderActual();
+      if (cookieHeader) {
+        finalOptions.headers = { ...(finalOptions.headers || {}), "Cookie": cookieHeader };
+      }
+    }
+    const response = await fetch(url, finalOptions);
+    if (esYoutube) leerCookiesDeRespuesta(response);
+    return response;
   } finally {
     clearTimeout(t);
   }
@@ -269,17 +399,107 @@ app.get("/health", (req, res) => {
     status: "ok",
     service: "Hache X Backend",
     quotaguard: !!proxyAgent,
+    proxiesDatacenter: proxiesDatacenter.map(p => p.etiqueta),
+    apiOficial: !!YOUTUBE_API_KEY,
+    proxyResidencial: !!residentialProxyAgent,
     cache: !!db
   });
 });
 
 // ========================================
+// Scraping de /results — función compartida entre TODOS los proxies de la
+// cascada (capa 1: cada uno de proxiesDatacenter; capa 3: residencial).
+// Devuelve el arreglo de videos, o null si falló (y en ese caso ya marcó el
+// posible bloqueo de ESTE proxy puntual en el circuit breaker).
+// ========================================
+async function intentarScrapeYouTube(query, agente, etiqueta) {
+  try {
+    const searchUrl = `https://www.youtube.com/results?search_query=${encodeURIComponent(query)}`;
+    const response  = await fetchConTimeout(searchUrl, { headers: HEADERS }, 8000, false, agente);
+    const html      = await response.text();
+    const match     = html.match(/var ytInitialData = ({.*?});/s);
+    if (!match) {
+      console.error(`⚠️ /search (${etiqueta}): no se pudo parsear "${query}" — status HTTP: ${response.status}`);
+      console.error(`⚠️ /search (${etiqueta}): primeros 500 caracteres de la respuesta:`, html.slice(0, 500));
+      marcarPosibleBloqueo(html, response.status, etiqueta);
+      return null;
+    }
+
+    const data     = JSON.parse(match[1]);
+    const contents = data?.contents?.twoColumnSearchResultsRenderer?.primaryContents
+      ?.sectionListRenderer?.contents?.[0]?.itemSectionRenderer?.contents || [];
+
+    const videos = contents
+      .filter(c => c.videoRenderer)
+      .slice(0, 20)
+      .map(c => {
+        const v = c.videoRenderer;
+        return {
+          videoId:   v.videoId,
+          title:     v.title?.runs?.[0]?.text || "",
+          channel:   v.ownerText?.runs?.[0]?.text || "",
+          thumbnail: v.thumbnail?.thumbnails?.slice(-1)[0]?.url || "",
+          duration:  v.lengthText?.simpleText || ""
+        };
+      });
+
+    console.log(`✅ /search (${etiqueta}): "${query}" — ${videos.length} resultados`);
+    return videos;
+  } catch (err) {
+    console.error(`⚠️ /search (${etiqueta}): error — ${err.message}`);
+    return null;
+  }
+}
+
+// ========================================
+// Capa 2: API oficial de YouTube Data v3 — respaldo gratuito de UNA sola
+// cuenta, respetando su tope real de 100 búsquedas/día (ver comentario
+// largo junto a YOUTUBE_API_KEY, arriba). No usa proxy — va directo, es
+// tráfico legítimo hacia la API oficial de Google, no scraping.
+// ========================================
+async function buscarViaAPIOficial(query) {
+  if (!YOUTUBE_API_KEY) return null;
+
+  const hoy = fechaPacificoHoy();
+  if (cuotaAPI.fecha !== hoy) { cuotaAPI.fecha = hoy; cuotaAPI.usadas = 0; }
+
+  if (cuotaAPI.usadas >= LIMITE_API_DIARIO) {
+    console.warn(`⚠️ /search: cuota diaria de la API oficial agotada (${LIMITE_API_DIARIO}/día) — saltando a la siguiente capa`);
+    return null;
+  }
+
+  try {
+    const url = `https://www.googleapis.com/youtube/v3/search?part=snippet&type=video&maxResults=20&q=${encodeURIComponent(query)}&key=${YOUTUBE_API_KEY}`;
+    const res = await fetchConTimeout(url, {}, 8000, false);
+    cuotaAPI.usadas++; // se cuenta el intento, tenga éxito o no — así lo cobra Google
+
+    if (!res.ok) {
+      const cuerpo = await res.text().catch(() => "");
+      console.warn(`⚠️ /search (api_oficial): status ${res.status} — ${cuerpo.slice(0, 200)}`);
+      return null;
+    }
+
+    const data = await res.json();
+    const videos = (data.items || [])
+      .filter(it => it.id?.videoId)
+      .map(it => ({
+        videoId:   it.id.videoId,
+        title:     it.snippet?.title || "",
+        channel:   it.snippet?.channelTitle || "",
+        thumbnail: it.snippet?.thumbnails?.high?.url || it.snippet?.thumbnails?.default?.url || "",
+        duration:  "" // search.list no trae duración; pedirla aparte costaría cuota extra
+      }));
+
+    console.log(`✅ /search (api_oficial): "${query}" — ${videos.length} resultados (${cuotaAPI.usadas}/${LIMITE_API_DIARIO} hoy)`);
+    return videos;
+  } catch (err) {
+    console.error(`⚠️ /search (api_oficial): error — ${err.message}`);
+    return null;
+  }
+}
+
+// ========================================
 // GET /search?q=nombre+artista
-// Primero consulta el caché de Firebase (cacheBusquedas). Si hay una
-// entrada vigente (menos de CACHE_TTL_MS), la devuelve directo — YouTube ni
-// se toca. Si no hay caché o venció, raspa YouTube como siempre y guarda el
-// resultado nuevo para la próxima vez (fire-and-forget: no bloquea la
-// respuesta al cliente si Firebase tarda en escribir).
 // ========================================
 app.get("/search", limiteYouTube, async (req, res) => {
   const query = req.query.q;
@@ -299,74 +519,56 @@ app.get("/search", limiteYouTube, async (req, res) => {
           const vigente = (Date.now() - cacheado.timestamp) < ttlAplicable;
           if (vigente && cacheado.videos) {
             console.log(`💾 /search: "${query}" servido desde caché (${cacheado.videos.length} resultados${cacheado.vacio ? ", vacío" : ""})`);
-            // Renovar el timestamp en cada hit (fire-and-forget) — una
-            // búsqueda con demanda activa nunca vence mientras la sigan
-            // pidiendo; solo vencen las que de verdad dejaron de buscarse.
             cacheRef.update({ timestamp: Date.now() })
               .catch(err => console.error("⚠️ Error renovando timestamp de caché:", err.message));
             return res.json({ videos: cacheado.videos, cache: true });
           }
         }
       } catch (err) {
-        // Si falla la lectura del caché, seguir con scraping normal —
-        // nunca dejar al cliente sin resultados por un problema de Firebase.
         console.error("⚠️ Error leyendo caché, se sigue con YouTube directo:", err.message);
       }
     }
 
-    // ── No hay caché válido: raspar YouTube ──
-    const searchUrl = `https://www.youtube.com/results?search_query=${encodeURIComponent(query)}`;
-    const response  = await fetchConTimeout(searchUrl, { headers: HEADERS });
-    const html      = await response.text();
-    const match     = html.match(/var ytInitialData = ({.*?});/s);
-    if (!match) {
-      // 🔍 Diagnóstico temporal (ago-2026): antes solo se sabía que falló el
-      // parseo, no POR QUÉ. Esto revela si YouTube está devolviendo un
-      // captcha/verificación de bot, una página de consentimiento, un error
-      // HTTP, o si de verdad cambió su estructura — sin esto es adivinar.
-      console.error(`⚠️ /search: no se pudo parsear "${query}" — status HTTP: ${response.status}`);
-      console.error(`⚠️ /search: primeros 500 caracteres de la respuesta:`, html.slice(0, 500));
-      return res.status(500).json({ error: "No se pudo parsear YouTube", statusYoutube: response.status });
+    // ── No hay caché válido: cascada de respaldo ──
+    // 🩹 (ago-2026 v2) Orden acordado con Hache — de más barato a más caro:
+    //   1. proxiesDatacenter (QuotaGuard + respaldos de otros proveedores),
+    //      probados en orden, saltando cualquiera que esté en enfriamiento.
+    //   2. API oficial de YouTube (gratis, una sola cuenta, 100/día).
+    //   3. Proxy residencial (cobra por GB — el más caro, va de último).
+    //   4. Nada funcionó → degradar con el aviso de "intenta en un momento".
+    let videos = null;
+    let fuente = null;
+
+    for (const { agente, etiqueta } of proxiesDatacenter) {
+      if (estaEnEnfriamiento(etiqueta)) {
+        console.warn(`🚫 /search: "${query}" — proxy "${etiqueta}" en enfriamiento, probando el siguiente`);
+        continue;
+      }
+      videos = await intentarScrapeYouTube(query, agente, etiqueta);
+      if (videos) { fuente = etiqueta; break; }
     }
 
-    const data     = JSON.parse(match[1]);
-    const contents = data?.contents?.twoColumnSearchResultsRenderer?.primaryContents
-      ?.sectionListRenderer?.contents?.[0]?.itemSectionRenderer?.contents || [];
+    if (!videos) {
+      videos = await buscarViaAPIOficial(query);
+      if (videos) fuente = "api_oficial";
+    }
 
-    // 🩹 (ago-2026) Antes se tomaban solo los primeros 6 — YouTube ya trae
-    // muchos más en la MISMA respuesta que se descargó, así que subir este
-    // tope a 20 no agrega ni una sola petición nueva a YouTube: solo se lee
-    // más de lo que ya llegó. Pedido del DJ: en hora pico, con solo 2-3
-    // letras necesita ver varias opciones, no 5-6.
-    const videos = contents
-      .filter(c => c.videoRenderer)
-      .slice(0, 20)
-      .map(c => {
-        const v = c.videoRenderer;
-        return {
-          videoId:   v.videoId,
-          title:     v.title?.runs?.[0]?.text || "",
-          channel:   v.ownerText?.runs?.[0]?.text || "",
-          thumbnail: v.thumbnail?.thumbnails?.slice(-1)[0]?.url || "",
-          duration:  v.lengthText?.simpleText || ""
-        };
-      });
+    if (!videos && residentialProxyAgent) {
+      videos = await intentarScrapeYouTube(query, residentialProxyAgent, "residencial");
+      if (videos) fuente = "residencial";
+    }
 
-    // ── Guardar en caché para la próxima vez (no bloquea la respuesta) ──
-    // 🎯 (ago-2026) Antes solo se guardaba si videos.length > 0 — una
-    // búsqueda con 0 resultados (typo, canción rara) NUNCA quedaba cacheada,
-    // así que se repetía en YouTube cada vez que alguien la volvía a pedir.
-    // Ahora se cachea SIEMPRE que la búsqueda a YouTube haya sido exitosa
-    // (con o sin resultados) — la de 0 resultados con vacio:true y su TTL
-    // corto (ver CACHE_TTL_VACIO_MS), para no dejar bloqueada 15 días una
-    // búsqueda que quizás sí tenga resultados más tarde.
+    if (!videos) {
+      return res.status(503).json({ error: "YouTube está limitando peticiones temporalmente, reintenta en un momento", enfriamiento: true });
+    }
+
     if (cacheRef) {
       const datos = { query, videos, timestamp: Date.now() };
       if (videos.length === 0) datos.vacio = true;
       guardarEnCacheConReintento(cacheRef, datos);
     }
 
-    res.json({ videos, cache: false });
+    res.json({ videos, cache: false, fuente });
   } catch (err) {
     console.error("Error en /search:", err.message);
     res.status(500).json({ error: "Error interno del servidor" });
@@ -375,12 +577,6 @@ app.get("/search", limiteYouTube, async (req, res) => {
 
 // ========================================
 // GET /check?videoId=XXX
-// Verifica si un video es embebible fuera de YouTube usando el mismo
-// innertube API oficial (cliente WEB), leyendo el campo real
-// playabilityStatus.playableInEmbed. Es la fuente de verdad de YouTube,
-// no una suposición — así el frontend puede decidir con anticipación si
-// manda el video por Invidious en lugar de esperar a que YouTube falle
-// visiblemente frente al público.
 // ========================================
 app.get("/check", limiteYouTube, async (req, res) => {
   const { videoId } = req.query;
@@ -416,36 +612,27 @@ app.get("/check", limiteYouTube, async (req, res) => {
     const status = playerData?.playabilityStatus?.status;
 
     if (status === "ERROR" || status === "LOGIN_REQUIRED" || status === "UNPLAYABLE") {
-      // El video ni siquiera existe/reproduce — no es un tema de embed.
       return res.json({ embeddable: false, reason: status });
     }
 
     const playableInEmbed = playerData?.playabilityStatus?.playableInEmbed;
-    // Campo ausente → asumir embebible (comportamiento conservador: mejor
-    // intentar YouTube normal que mandar de más a Invidious).
     const embeddable = playableInEmbed !== false;
 
     res.json({ embeddable, reason: embeddable ? null : "EMBED_RESTRICTED" });
   } catch (err) {
     console.error("Error en /check:", err.message);
-    // Ante cualquier fallo, responder embeddable:true — el frontend ya
-    // tiene su propio timeout de 3s y trata el error igual: sigue con
-    // YouTube normal en vez de bloquear la reproducción.
     res.status(500).json({ error: "Error interno del servidor", embeddable: true });
   }
 });
 
 // ========================================
 // GET /audio?videoId=XXX
-// Extrae URL directa del audio desde YouTube
-// sin yt-dlp, usando ytInitialPlayerResponse
 // ========================================
 app.get("/audio", limiteYouTube, async (req, res) => {
   const { videoId } = req.query;
   if (!videoId) return res.status(400).json({ error: "Falta videoId" });
 
   try {
-    // Método 1: innertube API (más estable)
     const innertubeRes = await fetchConTimeout("https://www.youtube.com/youtubei/v1/player?key=AIzaSyAO_FJ2SlqU8Q4STEHLGCilw_Y9_11qcW8", {
       method: "POST",
       headers: {
@@ -470,14 +657,12 @@ app.get("/audio", limiteYouTube, async (req, res) => {
 
     const playerData = await innertubeRes.json();
 
-    // Verificar si el video existe
     const status = playerData?.playabilityStatus?.status;
     if (status === "ERROR" || status === "LOGIN_REQUIRED" || status === "UNPLAYABLE") {
       console.warn(`⚠️ Video no disponible: ${videoId} — status: ${status}`);
       return res.status(403).json({ error: "Video no disponible", status });
     }
 
-    // Buscar formatos de solo audio (mejor calidad primero)
     const audioFormats = (playerData?.streamingData?.adaptiveFormats || [])
       .filter(f => f.mimeType && f.mimeType.startsWith("audio/") && f.url)
       .sort((a, b) => (b.bitrate || 0) - (a.bitrate || 0));
@@ -496,10 +681,12 @@ app.get("/audio", limiteYouTube, async (req, res) => {
       });
     }
 
-    // Método 2: raspar la página como fallback
     console.log("⚠️ Innertube no dio formatos, intentando scraping...");
     const pageRes  = await fetchConTimeout(`https://www.youtube.com/watch?v=${videoId}`, { headers: HEADERS });
     const html     = await pageRes.text();
+    // 🩹 (ago-2026) Mismo detector de bloqueo que /search — ver comentario
+    // junto al circuit breaker, arriba del archivo.
+    marcarPosibleBloqueo(html, pageRes.status, "quotaguard");
     const prMatch  = html.match(/ytInitialPlayerResponse\s*=\s*({.+?})\s*;/s);
     if (!prMatch) return res.status(500).json({ error: "No se pudo extraer player response" });
 
@@ -529,10 +716,18 @@ app.get("/duration", limiteYouTube, async (req, res) => {
   const { videoId } = req.query;
   if (!videoId) return res.status(400).json({ error: "Falta videoId" });
 
+  // 🩹 (ago-2026) Mismo circuit breaker que /search — usa la etiqueta del
+  // proxy principal, ya que /duration solo pasa por QuotaGuard, no por toda
+  // la cascada de respaldo (esa es específica de /search).
+  if (estaEnEnfriamiento("quotaguard")) {
+    return res.status(503).json({ error: "YouTube está limitando peticiones temporalmente, reintenta en un momento", enfriamiento: true });
+  }
+
   try {
     const url      = `https://www.youtube.com/watch?v=${videoId}`;
     const response = await fetchConTimeout(url, { headers: HEADERS });
     const html     = await response.text();
+    marcarPosibleBloqueo(html, response.status, "quotaguard");
 
     const patterns = [/"lengthSeconds":"(\d+)"/, /"lengthSeconds":(\d+)/, /lengthSeconds\\?":\\?"(\d+)/];
     for (const pattern of patterns) {
@@ -560,31 +755,6 @@ app.get("/duration", limiteYouTube, async (req, res) => {
 
 // ========================================
 // POST /genero
-// Segunda opinión de género vía IA (Claude Haiku), usada SOLO cuando el
-// filtro de palabras clave del frontend no pudo confirmar por sí solo el
-// género de una canción (ni a favor ni en contra). Body: { titulo, artista,
-// generos: [ids permitidos hoy], segundaOpinion: true|false }.
-//
-// DOS PISOS (ago-2026): Haiku responde siempre primero (rápido). Si Haiku
-// dice INSEGURO y el llamador pidió segundaOpinion:true, se le pregunta a
-// Sonnet como árbitro antes de decidir — más preciso en artistas poco
-// conocidos, a cambio de 1-3s extra SOLO en ese caso ambiguo (la mayoría de
-// las canciones las resuelve Haiku solo, sin ese costo). Si Haiku ya
-// respondió con confianza (coincide o no_coincide), Sonnet ni se consulta.
-//
-// Quién pide segundaOpinion:true — usuarios.html (verificarFiltroGenero):
-// hay un cliente real esperando en el momento, vale la pena la precisión
-// extra para no bloquear por error (caso real: "Magia Rosa" de Viti Ruiz).
-// Quién NO la pide (segundaOpinion:false u omitido) — el Piloto Automático:
-// nadie espera en vivo, y la mayoría de sus candidatos ya vienen resueltos
-// del caché que dejó usuarios.html, así que casi nunca llega a necesitar
-// siquiera el primer piso.
-//
-// SIEMPRE responde algo — nunca deja al front colgado ni le devuelve un
-// error que rompa el flujo. Si Anthropic tarda más de ANTHROPIC_TIMEOUT_MS,
-// falla, o la respuesta no es interpretable, responde { genero: null } —
-// el front lo trata como "insegura" (deja pasar la canción con la alarma
-// para el DJ, nunca bloquea por una falla del servicio).
 // ========================================
 const ANTHROPIC_TIMEOUT_MS = 4000;
 
@@ -600,11 +770,6 @@ NO_COINCIDE es una decision seria: bloquea a un cliente real de un bar en el mom
 No agregues explicaciones ni texto adicional — responde solo esa palabra, nada mas.`;
 }
 
-// Una sola llamada a Anthropic con el modelo indicado. Devuelve el texto
-// crudo de la respuesta (ya recortado), o null si algo falló.
-// viaProxy:false — esta llamada no es a YouTube, no debe pasar por
-// QuotaGuard (evita gastar ancho de banda del plan en algo que no lo
-// necesita).
 async function preguntarleAClaude(prompt, modelo) {
   const aiRes = await fetchConTimeout(
     "https://api.anthropic.com/v1/messages",
@@ -642,11 +807,6 @@ app.post("/genero", limiteGenero, async (req, res) => {
     return res.status(400).json({ error: "Faltan datos (titulo, generos)" });
   }
 
-  // 🛡️ (ago-2026) Validación de forma/tamaño — antes estos valores iban
-  // directo al prompt sin límite: alguien podía mandar un titulo de 2MB para
-  // inflar el costo de tokens o intentar manipular el prompt. Un título y
-  // artista reales de una canción caben de sobra en 300 caracteres, y una
-  // lista de géneros permitidos jamás pasa de unas decenas de ids cortos.
   if (typeof titulo !== "string" || titulo.length > 300) {
     return res.status(400).json({ error: "titulo inválido" });
   }
@@ -668,35 +828,24 @@ app.post("/genero", limiteGenero, async (req, res) => {
   const prompt = construirPromptGenero(titulo, artista, listaGeneros);
 
   try {
-    // ── Piso 1: Haiku (siempre) ──
     let texto = await preguntarleAClaude(prompt, "claude-haiku-4-5-20251001");
-    if (texto === null) return res.json({ genero: null }); // falló Anthropic → insegura, nunca bloquea
+    if (texto === null) return res.json({ genero: null });
 
     console.log(`🎵 /genero: "${titulo}" → Haiku respondió "${texto}"`);
 
-    // ── Piso 2: Sonnet, SOLO si Haiku va a BLOQUEAR y el llamador lo pidió ──
-    // 🩹 (ago-2026 fix) Antes esta condición EXCLUÍA "NO_COINCIDE" a propósito
-    // por error — dejaba pasar a Sonnet solo las respuestas raras/inseguras,
-    // pero un NO_COINCIDE directo de Haiku (el caso real: no reconoció a Viti
-    // Ruiz y bloqueó "Magia Rosa", que sí era salsa permitida) nunca llegaba
-    // a pedir el arbitraje. Ahora cualquier resultado que vaya a terminar en
-    // bloqueo pasa por Sonnet antes de decidir — es exactamente para ESO que
-    // se pidió la segunda opinión.
     const haikuBloquearia = texto === "NO_COINCIDE" || !generos.includes(texto);
     if (haikuBloquearia && segundaOpinion === true) {
       const textoSonnet = await preguntarleAClaude(prompt, "claude-sonnet-5");
       if (textoSonnet !== null) {
         console.log(`🎵 /genero: "${titulo}" → segunda opinión Sonnet respondió "${textoSonnet}"`);
-        texto = textoSonnet; // Sonnet manda la decisión final
+        texto = textoSonnet;
       }
-      // Si Sonnet falla, se sigue con lo que ya dijo Haiku — nunca se deja al
-      // front sin respuesta por culpa del segundo piso.
     }
 
     if (texto === "NO_COINCIDE") return res.json({ genero: "NO_COINCIDE" });
     if (!generos.includes(texto)) {
       if (texto !== "INSEGURO") console.warn(`⚠️ /genero: respuesta inesperada ("${texto}"), tratando como insegura`);
-      return res.json({ genero: null }); // INSEGURO o respuesta rara → tratar como insegura
+      return res.json({ genero: null });
     }
 
     return res.json({ genero: texto });
