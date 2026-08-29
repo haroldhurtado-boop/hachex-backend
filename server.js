@@ -164,6 +164,14 @@ function cookieHeaderActual() {
 // varias IPs de respaldo en rotación (ver más abajo), que UNA esté en
 // enfriamiento no debe impedir probar las otras. Cada proxy (identificado
 // por su "etiqueta") tiene su propio reloj de enfriamiento independiente.
+//
+// 🩹 (ago-2026 v3) NOTA: desde que existe el PUNTERO COMPARTIDO de abajo
+// (ver "PUNTERO COMPARTIDO — orden de avance sin retroceso"), este mecanismo
+// de enfriamiento ya NO es lo que decide si /search reintenta un proxy o no
+// — eso ahora lo hace el puntero (nunca vuelve atrás en la misma noche/ciclo,
+// sin importar el motivo del fallo). Este circuit breaker se deja intacto
+// porque sigue siendo información real y útil para /estado-proxies y los
+// logs (distingue una falla cualquiera de un bloqueo real de YouTube).
 const ENFRIAMIENTO_BLOQUEO_MS = 90 * 1000; // 90s
 const enfriamientoPorProxy = {}; // { etiqueta: timestamp hasta cuándo esperar }
  
@@ -271,6 +279,49 @@ for (let n = 2; n <= 20; n++) {
 }
  
 console.log(`✅ ${proxiesDatacenter.length} proxy(s) de centro de datos en rotación para /search`);
+ 
+// ========================================
+// PUNTERO COMPARTIDO — orden de avance sin retroceso (ago-2026 v4)
+// Idea de Hache tras el incidente del 28 ago (búsquedas trabadas 8s cada una
+// contra el mismo proxy fallando de forma intermitente): en vez de que CADA
+// búsqueda nueva vuelva a probar desde proxiesDatacenter[0], todas comparten
+// un mismo puntero de "en cuál proxy estamos parados ahora". Si el proxy
+// actual falla, el puntero avanza al siguiente y esa posición queda
+// descartada por el resto del ciclo — no se reintenta aunque ya se le haya
+// pasado el enfriamiento de 90s de arriba. Con eso, el costo del timeout
+// (ver TIMEOUT_DESCUBRIMIENTO_MS) lo paga UNA sola búsqueda por falla, no
+// todas las que lleguen después mientras el proxy sigue caído.
+//
+// Cuando el puntero pasa el último proxy de la lista, se intenta la API
+// oficial UNA vez (nunca se "asienta" ahí — no queremos gastar de a poco
+// las 100 búsquedas/día en cada búsqueda siguiente). Si también falla, recién
+// ahí se considera agotado el ciclo completo y el puntero vuelve a 0 para
+// que la power siguiente búsqueda arranque un ciclo nuevo desde el principio
+// — todos los proxies vuelven a tener su oportunidad, sin importar que
+// hayan quedado descartados minutos antes.
+// ========================================
+let punteroDatacenter = 0;
+ 
+// 2s: tiempo que se le da a un proxy de esta capa para responder antes de
+// darlo por caído y avanzar el puntero. Elegido junto con Hache: raspar
+// YouTube con un proxy sano suele tardar 1-2s, así que 2s da margen sin
+// ser el 8s que causó el problema — y como el puntero no vuelve atrás,
+// bajarlo de más habría arriesgado descartar proxies sanos por una
+// respuesta simplemente lenta, no caída. La API y el proxy residencial
+// (fuera de este puntero) NO cambian su timeout — se dejan en 8s.
+const TIMEOUT_DESCUBRIMIENTO_MS = 2000;
+ 
+// Avanza el puntero SOLO si sigue apuntando a la posición que acaba de
+// fallar — evita que varias búsquedas concurrentes, al fallar casi al
+// mismo tiempo contra el mismo proxy, hagan saltar el puntero varias
+// posiciones de golpe por una sola falla real. Es seguro sin locks porque
+// esta función es 100% síncrona (Node.js es de un solo hilo: nada más
+// puede correr en medio de estas dos líneas).
+function avanzarPunteroSiSigueEn(indice) {
+  if (punteroDatacenter === indice) {
+    punteroDatacenter = indice + 1;
+  }
+}
  
 // ========================================
 // Firebase Admin — caché de búsquedas (ago-2026)
@@ -413,11 +464,16 @@ app.get("/health", (req, res) => {
 // pausadas por un bloqueo reciente. Es estado en vivo del proceso (vive en
 // memoria, no en Firebase) — por eso es un endpoint aparte, no un dato que
 // se pueda leer directo desde admin.html.
+//
+// 🩹 (ago-2026 v4) Se agrega punteroDatacenter (posición actual del avance
+// sin retroceso) para que el panel también muestre cuál proxy está "en
+// turno" ahora mismo, no solo cuáles están en enfriamiento por bloqueo.
 // ========================================
 app.get("/estado-proxies", (req, res) => {
-  const proxies = proxiesDatacenter.map(p => ({
+  const proxies = proxiesDatacenter.map((p, i) => ({
     etiqueta: p.etiqueta,
-    disponible: !estaEnEnfriamiento(p.etiqueta)
+    disponible: !estaEnEnfriamiento(p.etiqueta),
+    descartadoEsteCiclo: i < punteroDatacenter
   }));
  
   const hoy = fechaPacificoHoy();
@@ -427,6 +483,9 @@ app.get("/estado-proxies", (req, res) => {
     proxies,
     totalProxies: proxies.length,
     disponiblesAhora: proxies.filter(p => p.disponible).length,
+    punteroActual: punteroDatacenter < proxiesDatacenter.length
+      ? proxiesDatacenter[punteroDatacenter].etiqueta
+      : "(agotado — próximo intento usa la API oficial)",
     apiOficial: YOUTUBE_API_KEY
       ? { usadasHoy: apiUsadasHoy, limite: LIMITE_API_DIARIO, disponible: apiUsadasHoy < LIMITE_API_DIARIO }
       : null,
@@ -439,11 +498,16 @@ app.get("/estado-proxies", (req, res) => {
 // cascada (capa 1: cada uno de proxiesDatacenter; capa 3: residencial).
 // Devuelve el arreglo de videos, o null si falló (y en ese caso ya marcó el
 // posible bloqueo de ESTE proxy puntual en el circuit breaker).
+//
+// 🩹 (ago-2026 v4) timeoutMs ahora es parámetro — la capa 1 (proxiesDatacenter)
+// llama con TIMEOUT_DESCUBRIMIENTO_MS (2s); la capa 3 (residencial) sigue
+// usando el default de 8s, sin cambios, porque no es donde se detectó el
+// problema y ya se paga como último recurso, no en cada búsqueda.
 // ========================================
-async function intentarScrapeYouTube(query, agente, etiqueta) {
+async function intentarScrapeYouTube(query, agente, etiqueta, timeoutMs = 8000) {
   try {
     const searchUrl = `https://www.youtube.com/results?search_query=${encodeURIComponent(query)}`;
-    const response  = await fetchConTimeout(searchUrl, { headers: HEADERS }, 8000, false, agente);
+    const response  = await fetchConTimeout(searchUrl, { headers: HEADERS }, timeoutMs, false, agente);
     const html      = await response.text();
     const match     = html.match(/var ytInitialData = ({.*?});/s);
     if (!match) {
@@ -558,36 +622,56 @@ app.get("/search", limiteYouTube, async (req, res) => {
     }
  
     // ── No hay caché válido: cascada de respaldo ──
-    // 🩹 (ago-2026 v2) Orden acordado con Hache — de más barato a más caro:
-    //   1. proxiesDatacenter (QuotaGuard + respaldos de otros proveedores),
-    //      probados en orden, saltando cualquiera que esté en enfriamiento.
-    //   2. API oficial de YouTube (gratis, una sola cuenta, 100/día).
-    //   3. Proxy residencial (cobra por GB — el más caro, va de último).
-    //   4. Nada funcionó → degradar con el aviso de "intenta en un momento".
+    // 🩹 (ago-2026 v4) Puntero compartido, sin retroceso — ver bloque
+    // "PUNTERO COMPARTIDO" más arriba. Se arranca en la posición actual
+    // (no siempre en 0), se avanza en cada falla, y solo se prueba la API
+    // oficial cuando el puntero ya pasó el último proxy de la lista. Si la
+    // API también falla, ahí sí se considera agotado el ciclo completo.
     let videos = null;
     let fuente = null;
+    let cicloAgotado = false;
  
-    for (const { agente, etiqueta } of proxiesDatacenter) {
-      if (estaEnEnfriamiento(etiqueta)) {
-        console.warn(`🚫 /search: "${query}" — proxy "${etiqueta}" en enfriamiento, probando el siguiente`);
-        continue;
-      }
-      videos = await intentarScrapeYouTube(query, agente, etiqueta);
+    while (punteroDatacenter < proxiesDatacenter.length) {
+      const i = punteroDatacenter;
+      const { agente, etiqueta } = proxiesDatacenter[i];
+      videos = await intentarScrapeYouTube(query, agente, etiqueta, TIMEOUT_DESCUBRIMIENTO_MS);
       if (videos) { fuente = etiqueta; break; }
+      // Falló este proxy → avanza el puntero (solo si nadie más ya lo hizo
+      // por esta misma falla) y sigue de una vez con el siguiente, sin
+      // pausa extra entre intentos.
+      avanzarPunteroSiSigueEn(i);
     }
  
-    if (!videos) {
+    if (!videos && punteroDatacenter >= proxiesDatacenter.length) {
+      // Ciclo de proxies de centro de datos agotado — un solo intento a la
+      // API oficial, sin quedarse ahí para las próximas búsquedas.
       videos = await buscarViaAPIOficial(query);
-      if (videos) fuente = "api_oficial";
+      if (videos) {
+        fuente = "api_oficial";
+      } else {
+        cicloAgotado = true;
+      }
+      // 🐛 (corregido) El ciclo de proxies para ESTA búsqueda ya se agotó,
+      // haya respondido bien la API o no — se reinicia el puntero para que
+      // la PRÓXIMA búsqueda vuelva a darle oportunidad a los proxies desde
+      // el primero. Antes esto solo pasaba en el "else" (API falló): si la
+      // API SÍ funcionaba, el puntero se quedaba pasado el último proxy y
+      // TODAS las búsquedas siguientes saltaban derecho a la API sin volver
+      // a intentar los proxies — vaciando la cuota de 100/día mucho más
+      // rápido de lo previsto.
+      punteroDatacenter = 0;
     }
  
     if (!videos && residentialProxyAgent) {
+      // Último recurso, por fuera del puntero — cobra por GB, así que se
+      // paga solo cuando de verdad no quedó nada más, no se reintenta en
+      // ciclos futuros como los proxies de centro de datos.
       videos = await intentarScrapeYouTube(query, residentialProxyAgent, "residencial");
       if (videos) fuente = "residencial";
     }
  
     if (!videos) {
-      return res.status(503).json({ error: "YouTube está limitando peticiones temporalmente, reintenta en un momento", enfriamiento: true });
+      return res.status(503).json({ error: "YouTube está limitando peticiones temporalmente, reintenta en un momento", enfriamiento: true, cicloAgotado });
     }
  
     if (cacheRef) {
