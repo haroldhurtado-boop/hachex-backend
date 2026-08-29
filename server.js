@@ -294,14 +294,91 @@ console.log(`✅ ${proxiesDatacenter.length} proxy(s) de centro de datos en rota
 //
 // Cuando el puntero pasa el último proxy de la lista, se intenta la API
 // oficial UNA vez (nunca se "asienta" ahí — no queremos gastar de a poco
-// las 100 búsquedas/día en cada búsqueda siguiente). Si también falla, recién
-// ahí se considera agotado el ciclo completo y el puntero vuelve a 0 para
-// que la power siguiente búsqueda arranque un ciclo nuevo desde el principio
-// — todos los proxies vuelven a tener su oportunidad, sin importar que
-// hayan quedado descartados minutos antes.
+// las 100 búsquedas/día en cada búsqueda siguiente). Se agotó el ciclo
+// completo (haya funcionado la API o no) → el puntero vuelve a 0 para que
+// la PRÓXIMA búsqueda arranque un ciclo nuevo desde el principio — todos
+// los proxies vuelven a tener su oportunidad, sin importar que hayan
+// quedado descartados minutos antes.
+//
+// 🩹 (ago-2026 v5) ASIGNACIÓN DE PROXIES POR LOCAL — pedido de Hache para
+// repartir tráfico entre locales y evitar que uno concentre demasiado en
+// una sola IP. `punteroDatacenter` de arriba pasa a llamarse "pool
+// general": el conjunto de proxies NO asignados a ningún local en
+// particular. Cada local con proxies propios asignados usa su PROPIO
+// puntero (`punterosPorLocal`), acotado solo a su lista — el mismo
+// mecanismo de avance sin retroceso, en miniatura.
+//
+// Aislamiento estricto (decisión de Hache): un local nunca toca proxies
+// asignados a OTRO local, ni siquiera si su pool general queda en cero —
+// en ese caso salta directo a la API, protegido igual por el reinicio de
+// ciclo de arriba (nunca gasta cupo de golpe).
+//
+// La asignación vive en Firebase en `locales/{id}/info/proxiesAsignados`
+// (mapa {etiqueta:true}, no un array — es el patrón recomendado en RTDB
+// para evitar huecos al borrar un elemento). El backend NO puede darse el
+// lujo de escuchar el nodo "locales" completo para enterarse de qué local
+// tiene algo asignado — cada local trae pedidos, chat, historial, etc., y
+// sería bajar toda esa data solo para leer un campito. Por eso existe un
+// índice liviano aparte, `config/localesConProxy/{localId}: true`, que
+// admin.html mantiene sincronizado junto con la asignación real — el
+// backend solo escucha ESE índice (siempre chico) y, por cada localId que
+// aparece ahí, escucha puntualmente su `info/proxiesAsignados` (también
+// chico) — nunca el local completo.
 // ========================================
-let punteroDatacenter = 0;
- 
+let punteroDatacenter = 0; // índice sobre el POOL GENERAL (ver poolGeneral())
+
+const punterosPorLocal = {};        // { localId: índice sobre asignacionPorLocal[localId] }
+const asignacionPorLocal = {};      // { localId: ["respaldo_5", ...] }
+const listenersProxyPorLocal = {};  // { localId: true } — evita doble listener si el índice repite el evento
+
+// Lookup rápido etiqueta → { agente, etiqueta } para no recorrer el arreglo
+// completo cada vez que un local necesita usar SU proxy por etiqueta.
+const proxiesPorEtiqueta = {};
+for (const p of proxiesDatacenter) proxiesPorEtiqueta[p.etiqueta] = p;
+
+function escucharAsignacionDeLocal(localId) {
+  if (!db || listenersProxyPorLocal[localId]) return;
+  listenersProxyPorLocal[localId] = true;
+  db.ref(`locales/${localId}/info/proxiesAsignados`).on("value", snap => {
+    const val = snap.val() || {};
+    // Se guarda como mapa {etiqueta:true} en Firebase — acá se pasa a
+    // lista simple para recorrer en JS. Se ignoran etiquetas que ya no
+    // existen en proxiesDatacenter (ej: alguien borró esa variable de
+    // Render) para no intentar usar un proxy que ya no está.
+    asignacionPorLocal[localId] = Object.keys(val).filter(k => val[k] && proxiesPorEtiqueta[k]);
+    // Si la lista se achicó, el puntero de este local podría quedar fuera
+    // de rango — se corrige solo en vez de esperar a que /search lo note.
+    if (punterosPorLocal[localId] > asignacionPorLocal[localId].length) {
+      punterosPorLocal[localId] = 0;
+    }
+  }, err => console.error(`⚠️ Error escuchando proxiesAsignados de ${localId}:`, err.message));
+}
+
+// Índice liviano de "qué locales tienen algo asignado" — nunca descarga los
+// locales completos, solo esta lista de booleans chica. admin.html escribe
+// acá cada vez que guarda una asignación (ver comentario arriba). El
+// arranque real de este listener vive más abajo, DESPUÉS de inicializar
+// Firebase Admin (acá `db` todavía no existe — solo se define la función).
+function iniciarEscuchaAsignacionesProxy() {
+  if (!db) return;
+  db.ref("config/localesConProxy").on("child_added", snap => {
+    if (snap.val()) escucharAsignacionDeLocal(snap.key);
+  });
+}
+
+// Arreglo de {agente,etiqueta} de los proxies de centro de datos que NO
+// están asignados a ningún local — es lo que antes era simplemente
+// "proxiesDatacenter" a secas. Se recalcula en cada llamado (barato: como
+// mucho unas pocas decenas de proxies) para reflejar asignaciones al
+// instante sin mantener un caché aparte que se pueda desincronizar.
+function poolGeneral() {
+  const asignados = new Set();
+  for (const lista of Object.values(asignacionPorLocal)) {
+    for (const etiqueta of lista) asignados.add(etiqueta);
+  }
+  return proxiesDatacenter.filter(p => !asignados.has(p.etiqueta));
+}
+
 // 2s: tiempo que se le da a un proxy de esta capa para responder antes de
 // darlo por caído y avanzar el puntero. Elegido junto con Hache: raspar
 // YouTube con un proxy sano suele tardar 1-2s, así que 2s da margen sin
@@ -310,16 +387,26 @@ let punteroDatacenter = 0;
 // respuesta simplemente lenta, no caída. La API y el proxy residencial
 // (fuera de este puntero) NO cambian su timeout — se dejan en 8s.
 const TIMEOUT_DESCUBRIMIENTO_MS = 2000;
- 
-// Avanza el puntero SOLO si sigue apuntando a la posición que acaba de
-// fallar — evita que varias búsquedas concurrentes, al fallar casi al
-// mismo tiempo contra el mismo proxy, hagan saltar el puntero varias
-// posiciones de golpe por una sola falla real. Es seguro sin locks porque
-// esta función es 100% síncrona (Node.js es de un solo hilo: nada más
-// puede correr en medio de estas dos líneas).
+
+// Avanza el puntero del POOL GENERAL solo si sigue apuntando a la posición
+// que acaba de fallar — evita que varias búsquedas concurrentes, al fallar
+// casi al mismo tiempo contra el mismo proxy, hagan saltar el puntero
+// varias posiciones de golpe por una sola falla real. Es seguro sin locks
+// porque esta función es 100% síncrona (Node.js es de un solo hilo: nada
+// más puede correr en medio de estas dos líneas).
 function avanzarPunteroSiSigueEn(indice) {
   if (punteroDatacenter === indice) {
     punteroDatacenter = indice + 1;
+  }
+}
+
+// Misma idea que la de arriba, pero para el puntero PROPIO de un local. Se
+// mantiene como función separada (no una genérica con parámetros por
+// referencia) porque opera sobre `punterosPorLocal[localId]`, no sobre una
+// variable suelta.
+function avanzarPunteroLocalSiSigueEn(localId, indice) {
+  if (punterosPorLocal[localId] === indice) {
+    punterosPorLocal[localId] = indice + 1;
   }
 }
  
@@ -380,11 +467,12 @@ if (fs.existsSync(SERVICE_ACCOUNT_PATH)) {
     });
     db = admin.database();
     console.log("✅ Firebase Admin conectado — caché de búsquedas activo");
+    iniciarEscuchaAsignacionesProxy(); // ver definición junto a poolGeneral() más arriba
   } catch (err) {
     console.error("⚠️ Error inicializando Firebase Admin — caché desactivado:", err.message);
   }
 } else {
-  console.warn("⚠️ firebase-service-account.json no encontrado — caché de búsquedas desactivado, todo va directo a YouTube");
+  console.warn("⚠️ firebase-service-account.json no encontrado — caché de búsquedas desactivado, todo va directo a YouTube — la asignación de proxies por local también queda desactivada (todo usa el pool general)");
 }
  
 // ========================================
@@ -470,22 +558,52 @@ app.get("/health", (req, res) => {
 // turno" ahora mismo, no solo cuáles están en enfriamiento por bloqueo.
 // ========================================
 app.get("/estado-proxies", (req, res) => {
-  const proxies = proxiesDatacenter.map((p, i) => ({
+  // Mapa etiqueta → local(es) que lo tienen asignado — para mostrarlo en
+  // admin.html sin que tenga que cruzar datos por su cuenta.
+  const asignadoA = {};
+  for (const [localId, etiquetas] of Object.entries(asignacionPorLocal)) {
+    for (const etiqueta of etiquetas) {
+      (asignadoA[etiqueta] = asignadoA[etiqueta] || []).push(localId);
+    }
+  }
+
+  const pool = poolGeneral();
+  const indicePool = new Map(pool.map((p, i) => [p.etiqueta, i]));
+
+  const proxies = proxiesDatacenter.map(p => ({
     etiqueta: p.etiqueta,
     disponible: !estaEnEnfriamiento(p.etiqueta),
-    descartadoEsteCiclo: i < punteroDatacenter
+    asignadoA: asignadoA[p.etiqueta] || [], // [] = libre, en el pool general
+    // Solo tiene sentido "descartado este ciclo" para los que SÍ están en
+    // el pool general — un proxy asignado a un local sigue su propio
+    // puntero, que se reporta aparte en "asignacionesPorLocal".
+    descartadoEsteCiclo: indicePool.has(p.etiqueta) ? indicePool.get(p.etiqueta) < punteroDatacenter : null
   }));
  
   const hoy = fechaPacificoHoy();
   const apiUsadasHoy = (cuotaAPI.fecha === hoy) ? cuotaAPI.usadas : 0;
+
+  const asignacionesPorLocal = Object.fromEntries(
+    Object.entries(asignacionPorLocal).map(([localId, etiquetas]) => [
+      localId,
+      {
+        proxies: etiquetas,
+        punteroActual: (punterosPorLocal[localId] || 0) < etiquetas.length
+          ? etiquetas[punterosPorLocal[localId] || 0]
+          : "(agotado este ciclo — cae al pool general)"
+      }
+    ])
+  );
  
   res.json({
     proxies,
     totalProxies: proxies.length,
     disponiblesAhora: proxies.filter(p => p.disponible).length,
-    punteroActual: punteroDatacenter < proxiesDatacenter.length
-      ? proxiesDatacenter[punteroDatacenter].etiqueta
-      : "(agotado — próximo intento usa la API oficial)",
+    poolGeneral: pool.map(p => p.etiqueta),
+    punteroActual: punteroDatacenter < pool.length
+      ? pool[punteroDatacenter].etiqueta
+      : "(pool general agotado — próximo intento usa la API oficial)",
+    asignacionesPorLocal,
     apiOficial: YOUTUBE_API_KEY
       ? { usadasHoy: apiUsadasHoy, limite: LIMITE_API_DIARIO, disponible: apiUsadasHoy < LIMITE_API_DIARIO }
       : null,
@@ -594,7 +712,11 @@ async function buscarViaAPIOficial(query) {
 // GET /search?q=nombre+artista
 // ========================================
 app.get("/search", limiteYouTube, async (req, res) => {
-  const query = req.query.q;
+  const query   = req.query.q;
+  // 🩹 (ago-2026 v5) 'local' es opcional y retrocompatible a propósito: si
+  // no llega (frontend viejo en caché, o llamada externa), la búsqueda
+  // simplemente usa el pool general — el comportamiento de siempre.
+  const localId = req.query.local || null;
   if (!query) return res.status(400).json({ error: "Falta el parámetro q" });
  
   const clave = normalizarClaveCache(query);
@@ -622,27 +744,64 @@ app.get("/search", limiteYouTube, async (req, res) => {
     }
  
     // ── No hay caché válido: cascada de respaldo ──
-    // 🩹 (ago-2026 v4) Puntero compartido, sin retroceso — ver bloque
-    // "PUNTERO COMPARTIDO" más arriba. Se arranca en la posición actual
-    // (no siempre en 0), se avanza en cada falla, y solo se prueba la API
-    // oficial cuando el puntero ya pasó el último proxy de la lista. Si la
-    // API también falla, ahí sí se considera agotado el ciclo completo.
+    // 🩹 (ago-2026 v5) Orden completo para un local CON proxies propios
+    // asignados: sus proxies → pool general (los no asignados a nadie) →
+    // API oficial (un intento) → residencial. Un local SIN asignación
+    // (el caso de todos hoy, y el default de cualquier local nuevo) salta
+    // directo al paso del pool general — funciona exactamente como antes.
     let videos = null;
     let fuente = null;
     let cicloAgotado = false;
- 
-    while (punteroDatacenter < proxiesDatacenter.length) {
-      const i = punteroDatacenter;
-      const { agente, etiqueta } = proxiesDatacenter[i];
-      videos = await intentarScrapeYouTube(query, agente, etiqueta, TIMEOUT_DESCUBRIMIENTO_MS);
-      if (videos) { fuente = etiqueta; break; }
-      // Falló este proxy → avanza el puntero (solo si nadie más ya lo hizo
-      // por esta misma falla) y sigue de una vez con el siguiente, sin
-      // pausa extra entre intentos.
-      avanzarPunteroSiSigueEn(i);
+
+    // ── Capa 0: proxies propios del local (si tiene asignados) ──
+    // Aislamiento estricto (decisión de Hache): esta capa NUNCA toca un
+    // proxy asignado a OTRO local — solo recorre su propia lista.
+    const propios = localId ? (asignacionPorLocal[localId] || []) : [];
+    if (propios.length) {
+      if (!(punterosPorLocal[localId] < propios.length)) punterosPorLocal[localId] = 0;
+      while (punterosPorLocal[localId] < propios.length) {
+        const i = punterosPorLocal[localId];
+        const etiqueta = propios[i];
+        const proxyInfo = proxiesPorEtiqueta[etiqueta];
+        if (proxyInfo) {
+          videos = await intentarScrapeYouTube(query, proxyInfo.agente, etiqueta, TIMEOUT_DESCUBRIMIENTO_MS);
+          if (videos) { fuente = etiqueta; break; }
+        }
+        avanzarPunteroLocalSiSigueEn(localId, i);
+      }
+      if (!videos) {
+        // Ciclo PROPIO de este local agotado — se reinicia ya (no hace
+        // falta esperar a que también falle la API, a diferencia del pool
+        // general): la próxima búsqueda de ESTE local vuelve a intentar
+        // sus propios proxies desde el primero, dándoles otra chance.
+        punterosPorLocal[localId] = 0;
+      }
+    }
+
+    // ── Capa 1: pool general (proxies no asignados a ningún local) ──
+    // Puntero compartido, sin retroceso — ver bloque "PUNTERO COMPARTIDO"
+    // más arriba. Se arranca en la posición actual (no siempre en 0), se
+    // avanza en cada falla, y se auto-corrige si la lista se achicó (un
+    // proxy que antes estaba libre y acaba de asignarse a un local). Se
+    // calcula UNA sola vez (no en cada chequeo) para que la condición de
+    // "se agotó" de más abajo use exactamente la misma lista, sin riesgo
+    // de que una asignación cambie a mitad de esta misma búsqueda.
+    const pool = poolGeneral();
+    if (!videos) {
+      if (!(punteroDatacenter < pool.length)) punteroDatacenter = 0;
+      while (punteroDatacenter < pool.length) {
+        const i = punteroDatacenter;
+        const { agente, etiqueta } = pool[i];
+        videos = await intentarScrapeYouTube(query, agente, etiqueta, TIMEOUT_DESCUBRIMIENTO_MS);
+        if (videos) { fuente = etiqueta; break; }
+        // Falló este proxy → avanza el puntero (solo si nadie más ya lo hizo
+        // por esta misma falla) y sigue de una vez con el siguiente, sin
+        // pausa extra entre intentos.
+        avanzarPunteroSiSigueEn(i);
+      }
     }
  
-    if (!videos && punteroDatacenter >= proxiesDatacenter.length) {
+    if (!videos && punteroDatacenter >= pool.length) {
       // Ciclo de proxies de centro de datos agotado — un solo intento a la
       // API oficial, sin quedarse ahí para las próximas búsquedas.
       videos = await buscarViaAPIOficial(query);
@@ -692,7 +851,7 @@ app.get("/search", limiteYouTube, async (req, res) => {
     // que no crecen sin límite: una búsqueda repetida actualiza su propia
     // entrada en vez de crear una nueva cada vez.
     if (db && fuente) {
-      db.ref(`busquedasEnVivo/${clave}`).set({ query, fuente, timestamp: Date.now() })
+      db.ref(`busquedasEnVivo/${clave}`).set({ query, fuente, localId: localId || null, timestamp: Date.now() })
         .catch(err => console.error("⚠️ Error registrando búsqueda en vivo:", err.message));
       db.ref(`estadisticasProxy/${fuente}`).transaction(actual => {
         actual = actual || { usos: 0 };
@@ -700,6 +859,13 @@ app.get("/search", limiteYouTube, async (req, res) => {
         actual.ultimoUso = Date.now();
         return actual;
       }).catch(err => console.error("⚠️ Error registrando estadística de proxy:", err.message));
+      // 🩹 (ago-2026 v5) Pedido de Hache: saber qué local está gatillando la
+      // API oficial seguido (recurso compartido y limitado, 100/día para
+      // TODOS los locales) — antes no quedaba ningún rastro de esto.
+      if (fuente === "api_oficial" && localId) {
+        db.ref(`estadisticasProxy/api_oficial/porLocal/${localId}`).transaction(actual => (actual || 0) + 1)
+          .catch(err => console.error("⚠️ Error registrando uso de API por local:", err.message));
+      }
     }
  
     res.json({ videos, cache: false, fuente });
