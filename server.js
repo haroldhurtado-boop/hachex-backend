@@ -110,20 +110,117 @@ const limiteGenero = rateLimit({
 //
 // Headers ampliados — antes solo tenían 3 campos, siempre idénticos en cada
 // petición; un navegador real manda muchos más y varían por request.
-const HEADERS = {
-  "User-Agent":               "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-  "Accept-Language":          "es-ES,es;q=0.9,en;q=0.8",
-  "Accept":                   "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-  "Accept-Encoding":          "gzip, deflate, br",
-  "sec-ch-ua":                '"Not_A Brand";v="8", "Chromium";v="120", "Google Chrome";v="120"',
-  "sec-ch-ua-mobile":         "?0",
-  "sec-ch-ua-platform":       '"Windows"',
-  "Sec-Fetch-Dest":           "document",
-  "Sec-Fetch-Mode":           "navigate",
-  "Sec-Fetch-Site":           "none",
-  "Sec-Fetch-User":           "?1",
-  "Upgrade-Insecure-Requests": "1"
-};
+//
+// 🩹 (sep-2026) HEADERS POR PROXY: lo de arriba resolvía "pocos campos,
+// siempre iguales" — pero seguía siendo UN SOLO set de headers para las 10
+// IPs de respaldo. Mismo problema de fondo que el cookie jar compartido
+// (ver más abajo): 10 identidades de IP distintas, pero una sola huella de
+// navegador idéntica letra por letra. Ahora cada etiqueta recibe un perfil
+// FIJO (siempre el mismo para esa etiqueta — un navegador real no cambia de
+// versión a cada rato) elegido por hash de su nombre de una lista de
+// perfiles reales y variados — así una IP nueva que se agregue en el futuro
+// (respaldo_12, _13...) también recibe un perfil consistente sin tocar
+// código.
+const PERFILES_HEADERS = [
+  {
+    "User-Agent":               "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
+    "Accept-Language":          "es-CO,es;q=0.9,en;q=0.8",
+    "Accept":                   "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+    "Accept-Encoding":          "gzip, deflate, br",
+    "sec-ch-ua":                '"Chromium";v="128", "Not;A=Brand";v="24", "Google Chrome";v="128"',
+    "sec-ch-ua-mobile":         "?0",
+    "sec-ch-ua-platform":       '"Windows"',
+    "Sec-Fetch-Dest":           "document",
+    "Sec-Fetch-Mode":           "navigate",
+    "Sec-Fetch-Site":           "none",
+    "Sec-Fetch-User":           "?1",
+    "Upgrade-Insecure-Requests": "1"
+  },
+  {
+    "User-Agent":               "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/129.0.0.0 Safari/537.36",
+    "Accept-Language":          "es-ES,es;q=0.9,en-US;q=0.8,en;q=0.7",
+    "Accept":                   "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+    "Accept-Encoding":          "gzip, deflate, br",
+    "sec-ch-ua":                '"Google Chrome";v="129", "Not=A?Brand";v="8", "Chromium";v="129"',
+    "sec-ch-ua-mobile":         "?0",
+    "sec-ch-ua-platform":       '"macOS"',
+    "Sec-Fetch-Dest":           "document",
+    "Sec-Fetch-Mode":           "navigate",
+    "Sec-Fetch-Site":           "none",
+    "Sec-Fetch-User":           "?1",
+    "Upgrade-Insecure-Requests": "1"
+  },
+  {
+    "User-Agent":               "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/127.0.0.0 Safari/537.36 Edg/127.0.0.0",
+    "Accept-Language":          "es-MX,es;q=0.9,en;q=0.8",
+    "Accept":                   "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+    "Accept-Encoding":          "gzip, deflate, br",
+    "sec-ch-ua":                '"Microsoft Edge";v="127", "Not)A;Brand";v="99", "Chromium";v="127"',
+    "sec-ch-ua-mobile":         "?0",
+    "sec-ch-ua-platform":       '"Windows"',
+    "Sec-Fetch-Dest":           "document",
+    "Sec-Fetch-Mode":           "navigate",
+    "Sec-Fetch-Site":           "none",
+    "Sec-Fetch-User":           "?1",
+    "Upgrade-Insecure-Requests": "1"
+  },
+  {
+    // Firefox no manda sec-ch-ua/sec-ch-ua-mobile/sec-ch-ua-platform — no
+    // implementa esa parte del estándar de Client Hints, así que este
+    // perfil los omite a propósito (mandarlos sería MÁS raro que no
+    // mandarlos, para un User-Agent de Firefox).
+    "User-Agent":               "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:130.0) Gecko/20100101 Firefox/130.0",
+    "Accept-Language":          "es-ES,es;q=0.8,en-US;q=0.5,en;q=0.3",
+    "Accept":                   "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+    "Accept-Encoding":          "gzip, deflate, br",
+    "Sec-Fetch-Dest":           "document",
+    "Sec-Fetch-Mode":           "navigate",
+    "Sec-Fetch-Site":           "none",
+    "Sec-Fetch-User":           "?1",
+    "Upgrade-Insecure-Requests": "1"
+  },
+  {
+    "User-Agent":               "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
+    "Accept-Language":          "es-419,es;q=0.9,en;q=0.7",
+    "Accept":                   "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+    "Accept-Encoding":          "gzip, deflate, br",
+    "sec-ch-ua":                '"Chromium";v="128", "Not;A=Brand";v="24", "Google Chrome";v="128"',
+    "sec-ch-ua-mobile":         "?0",
+    "sec-ch-ua-platform":       '"Linux"',
+    "Sec-Fetch-Dest":           "document",
+    "Sec-Fetch-Mode":           "navigate",
+    "Sec-Fetch-Site":           "none",
+    "Sec-Fetch-User":           "?1",
+    "Upgrade-Insecure-Requests": "1"
+  },
+  {
+    "User-Agent":               "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+    "Accept-Language":          "es-CO,es-419;q=0.9,es;q=0.8,en;q=0.6",
+    "Accept":                   "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+    "Accept-Encoding":          "gzip, deflate, br",
+    "sec-ch-ua":                '"Not/A)Brand";v="8", "Chromium";v="126", "Google Chrome";v="126"',
+    "sec-ch-ua-mobile":         "?0",
+    "sec-ch-ua-platform":       '"Windows"',
+    "Sec-Fetch-Dest":           "document",
+    "Sec-Fetch-Mode":           "navigate",
+    "Sec-Fetch-Site":           "none",
+    "Sec-Fetch-User":           "?1",
+    "Upgrade-Insecure-Requests": "1"
+  }
+];
+ 
+// Hash simple y estable (misma etiqueta → mismo número siempre, así el
+// perfil de cada IP no cambia de una petición a otra) — funciona igual de
+// bien si mañana se agrega una 12ª o 20ª IP, sin tocar este código.
+function hashEtiqueta(etiqueta) {
+  let h = 0;
+  for (let i = 0; i < etiqueta.length; i++) h = (h * 31 + etiqueta.charCodeAt(i)) >>> 0;
+  return h;
+}
+ 
+function headersDeProxy(etiqueta) {
+  return PERFILES_HEADERS[hashEtiqueta(etiqueta) % PERFILES_HEADERS.length];
+}
  
 // ── Cookie jar simple para youtube.com ──────────────────────────────────
 // node-fetch no maneja cookies solo — cada petición le llegaba a YouTube
@@ -132,22 +229,35 @@ const HEADERS = {
 // devuelve y las reenvía en la siguiente petición, como haría un navegador.
 // Es un jar único compartido (no por usuario) — correcto acá porque quien
 // "navega" es el backend mismo, no cada cliente.
-let cookieJarYouTube = {};
+//
+// 🩹 (sep-2026) CORRECCIÓN — "compartido" dejó de ser correcto al agregar
+// las 10 IPs de respaldo: con un jar único, la MISMA cookie de sesión
+// viajaba entre las 10 direcciones distintas. Si YouTube correlaciona por
+// cookie (técnica estándar de detección de fraude, igual que por IP), eso
+// es una señal directa de "esta es la misma identidad saltando de IP en
+// IP" — más sospechoso que no tener cookies del todo. Ahora es un jar POR
+// ETIQUETA: cada proxy acumula su propia cookie, independiente de las
+// demás — "quotaguard" se usa como identidad por defecto para las llamadas
+// que no pasan por la cascada de /search (ej. /check, /audio, /duration).
+const cookieJarsPorProxy = {}; // { etiqueta: { nombreCookie: valor } }
  
-function leerCookiesDeRespuesta(response) {
+function leerCookiesDeRespuesta(response, etiqueta) {
   const setCookie = typeof response.headers.raw === "function"
     ? response.headers.raw()["set-cookie"]
     : null;
   if (!setCookie) return;
+  const jar = cookieJarsPorProxy[etiqueta] || (cookieJarsPorProxy[etiqueta] = {});
   for (const linea of setCookie) {
     const [par] = linea.split(";");
     const idx = par.indexOf("=");
-    if (idx > 0) cookieJarYouTube[par.slice(0, idx).trim()] = par.slice(idx + 1).trim();
+    if (idx > 0) jar[par.slice(0, idx).trim()] = par.slice(idx + 1).trim();
   }
 }
  
-function cookieHeaderActual() {
-  const entradas = Object.entries(cookieJarYouTube);
+function cookieHeaderDeProxy(etiqueta) {
+  const jar = cookieJarsPorProxy[etiqueta];
+  if (!jar) return null;
+  const entradas = Object.entries(jar);
   if (!entradas.length) return null;
   return entradas.map(([k, v]) => `${k}=${v}`).join("; ");
 }
@@ -172,14 +282,6 @@ function cookieHeaderActual() {
 // sin importar el motivo del fallo). Este circuit breaker se deja intacto
 // porque sigue siendo información real y útil para /estado-proxies y los
 // logs (distingue una falla cualquiera de un bloqueo real de YouTube).
-//
-// 🩹 (sep-2026) AMPLIADO: ahora también entra aquí un timeout aislado (no
-// solo el patrón de captcha/429), con su propio enfriamiento más corto — ver
-// ENFRIAMIENTO_TIMEOUT_MS y marcarTimeoutTransitorio() más abajo. Motivo:
-// la noche del 2 sep, 5 proxies fallaron por timeout (no por bloqueo real de
-// YouTube) y el puntero, al no tener forma de saberlo, los descartó sin
-// posibilidad de reintento el resto de la noche — todo el tráfico terminó
-// concentrado en una sola IP.
 const ENFRIAMIENTO_BLOQUEO_MS = 90 * 1000; // 90s
 const enfriamientoPorProxy = {}; // { etiqueta: timestamp hasta cuándo esperar }
  
@@ -201,10 +303,13 @@ function estaEnEnfriamiento(etiqueta) {
 }
  
 // 🩹 (sep-2026) Enfriamiento corto para timeouts aislados — distinto del de
-// bloqueo real de arriba (90s). Un timeout puntual suele ser un bache de red
-// pasajero, no un bloqueo de YouTube, así que se castiga menos tiempo (45s).
-// No acorta un enfriamiento más largo que ya esté activo (ej. si ese proxy
-// ya está en enfriamiento por bloqueo real, no lo bajamos a 45s).
+// bloqueo real de arriba (90s). Incidente del 2 sep: 5 proxies fallaron por
+// timeout (no por bloqueo real de YouTube) y no había forma de registrarlo
+// aquí — se descartaron sin posibilidad de reintento el resto de la noche.
+// Un timeout puntual suele ser un bache de red pasajero, así que se castiga
+// menos tiempo (45s) que un bloqueo confirmado. No acorta un enfriamiento
+// más largo que ya esté activo (ej. si ese proxy ya está en enfriamiento
+// por bloqueo real, no lo bajamos a 45s).
 const ENFRIAMIENTO_TIMEOUT_MS = 45 * 1000; // 45s
  
 function marcarTimeoutTransitorio(etiqueta) {
@@ -277,7 +382,15 @@ if (residentialProxyAgent) {
   console.warn("⚠️ RESIDENTIAL_PROXY_URL no configurada — la capa de respaldo residencial queda desactivada");
 }
  
-// ── Capa 1: lista rotativa de proxies de centro de datos ──
+// ── Capa 1: lista rotativa de proxies residenciales estáticos (Webshare) ──
+// 🩹 (sep-2026) CORRECCIÓN DE NOMBRE: este comentario decía "de centro de
+// datos" — incorrecto. Son residenciales ESTÁTICOS (plan "Vivienda
+// estática" de Webshare): su ASN se presenta como proveedor de internet
+// residencial real, no como datacenter. Ese error de descripción causó una
+// confusión real en una sesión de trabajo — de ahí esta nota. El nombre de
+// variable (`proxiesDatacenter`) se queda igual para no tocar el resto del
+// código sin necesidad.
+//
 // QuotaGuard es el principal (ya pagado, va primero). Cada correo/cuenta
 // nueva que Hache consiga con OTRO proveedor de IP fija se agrega acá sin
 // tocar el resto del código — solo definiendo su variable de entorno
@@ -300,7 +413,7 @@ for (let n = 2; n <= 20; n++) {
   }
 }
  
-console.log(`✅ ${proxiesDatacenter.length} proxy(s) de centro de datos en rotación para /search`);
+console.log(`✅ ${proxiesDatacenter.length} proxy(s) residenciales estáticos en rotación para /search`);
  
 // ========================================
 // PUNTERO COMPARTIDO — orden de avance sin retroceso (ago-2026 v4)
@@ -321,14 +434,6 @@ console.log(`✅ ${proxiesDatacenter.length} proxy(s) de centro de datos en rota
 // la PRÓXIMA búsqueda arranque un ciclo nuevo desde el principio — todos
 // los proxies vuelven a tener su oportunidad, sin importar que hayan
 // quedado descartados minutos antes.
-//
-// 🩹 (sep-2026) NOTA IMPORTANTE tras el incidente del 2 sep: "sin importar
-// que hayan quedado descartados minutos antes" seguía siendo cierto en el
-// sentido de que el ciclo completo se reinicia — pero mientras el ciclo NO
-// se agota (tráfico bajo, un solo local), un proxy descartado por un timeout
-// puntual se quedaba fuera el resto de la noche sin ninguna forma de
-// recuperarse antes de eso. Los dos cambios de abajo (saltar los que están
-// en enfriamiento, y avanzar el puntero también en ÉXITO) atacan justo eso.
 //
 // 🩹 (ago-2026 v5) ASIGNACIÓN DE PROXIES POR LOCAL — pedido de Hache para
 // repartir tráfico entre locales y evitar que uno concentre demasiado en
@@ -354,6 +459,17 @@ console.log(`✅ ${proxiesDatacenter.length} proxy(s) de centro de datos en rota
 // backend solo escucha ESE índice (siempre chico) y, por cada localId que
 // aparece ahí, escucha puntualmente su `info/proxiesAsignados` (también
 // chico) — nunca el local completo.
+//
+// 🩹 (sep-2026) HISTORIAL DE ESTE MECANISMO tras el incidente del 2 sep:
+// se probó que el puntero avanzara TAMBIÉN en éxito (no solo en fallo),
+// para que ninguna IP se quedara con todo el tráfico. Funcionó, pero
+// reveló un efecto no previsto: como Hache X hace búsqueda en vivo (una
+// petición por cada letra escrita), el puntero avanzaba una posición por
+// CADA TECLA — las 10 IPs se agotaban en ~2 minutos con una sola persona
+// escribiendo, mucho más agresivo de lo que se buscaba. Se volvió a
+// avanzar SOLO en fallo (como el diseño original de arriba) — el riesgo de
+// que una IP sana concentre todo el tráfico por horas se cubre aparte con
+// la ROTACIÓN POR TIEMPO (ver más abajo, junto a avanzarPunteroLocalSiSigueEn).
 // ========================================
 let punteroDatacenter = 0; // índice sobre el POOL GENERAL (ver poolGeneral())
  
@@ -382,6 +498,10 @@ function escucharAsignacionDeLocal(localId) {
       punterosPorLocal[localId] = 0;
     }
   }, err => console.error(`⚠️ Error escuchando proxiesAsignados de ${localId}:`, err.message));
+  // 🩹 (sep-2026) Arranca también la rotación por tiempo de este local en
+  // cuanto se conoce su asignación — ver definición junto a
+  // programarRotacionGeneral() más arriba.
+  programarRotacionLocal(localId);
 }
  
 // Índice liviano de "qué locales tienen algo asignado" — nunca descarga los
@@ -396,7 +516,7 @@ function iniciarEscuchaAsignacionesProxy() {
   });
 }
  
-// Arreglo de {agente,etiqueta} de los proxies de centro de datos que NO
+// Arreglo de {agente,etiqueta} de los proxies residenciales estáticos que NO
 // están asignados a ningún local — es lo que antes era simplemente
 // "proxiesDatacenter" a secas. Se recalcula en cada llamado (barato: como
 // mucho unas pocas decenas de proxies) para reflejar asignaciones al
@@ -438,6 +558,62 @@ function avanzarPunteroLocalSiSigueEn(localId, indice) {
   if (punterosPorLocal[localId] === indice) {
     punterosPorLocal[localId] = indice + 1;
   }
+}
+ 
+// ========================================
+// ROTACIÓN POR TIEMPO (sep-2026) — evita que una IP sana concentre todo el
+// tráfico indefinidamente. Con "avanza solo en fallo", una IP que nunca
+// falla podría servir el 100% del tráfico por horas — un volumen sostenido
+// y prolongado desde una sola identidad residencial es, en sí mismo, un
+// patrón fuera de lo normal (un usuario residencial real no genera
+// cientos de peticiones automatizadas toda la noche sin parar). Esto le
+// da el turno a la SIGUIENTE IP de la fila cada cierto tiempo, sin esperar
+// a que la actual falle.
+//
+// A propósito NO es un intervalo fijo — cada vuelta sortea un número nuevo
+// entre 4 y 12 minutos, para que no haya ningún reloj detectable desde
+// afuera.
+// ========================================
+const MIN_ROTACION_MS = 4 * 60 * 1000;
+const MAX_ROTACION_MS = 12 * 60 * 1000;
+ 
+function proximoIntervaloRotacion() {
+  return MIN_ROTACION_MS + Math.floor(Math.random() * (MAX_ROTACION_MS - MIN_ROTACION_MS));
+}
+ 
+function programarRotacionGeneral() {
+  setTimeout(() => {
+    const pool = poolGeneral();
+    if (pool.length > 0) {
+      const anterior = pool[punteroDatacenter % pool.length]?.etiqueta;
+      punteroDatacenter = (punteroDatacenter + 1) % pool.length;
+      console.log(`🔄 Rotación por tiempo (pool general): "${anterior}" → "${pool[punteroDatacenter].etiqueta}"`);
+    }
+    programarRotacionGeneral();
+  }, proximoIntervaloRotacion());
+}
+programarRotacionGeneral();
+ 
+// Un timer independiente por local con proxies propios — arranca la
+// primera vez que ese local aparece en escucharAsignacionDeLocal().
+// timersRotacionPorLocal evita programar más de uno si Firebase dispara el
+// evento varias veces para el mismo local.
+const timersRotacionPorLocal = {};
+ 
+function programarRotacionLocal(localId) {
+  if (timersRotacionPorLocal[localId]) return;
+  timersRotacionPorLocal[localId] = true;
+  const ejecutar = () => {
+    const lista = asignacionPorLocal[localId] || [];
+    if (lista.length > 0) {
+      const actual = punterosPorLocal[localId] || 0;
+      const anterior = lista[actual % lista.length];
+      punterosPorLocal[localId] = (actual + 1) % lista.length;
+      console.log(`🔄 Rotación por tiempo (local ${localId}): "${anterior}" → "${lista[punterosPorLocal[localId]]}"`);
+    }
+    setTimeout(ejecutar, proximoIntervaloRotacion());
+  };
+  setTimeout(ejecutar, proximoIntervaloRotacion());
 }
  
 // ========================================
@@ -530,7 +706,7 @@ function normalizarClaveCache(query) {
 // por esa IP fija. Pasar viaProxy:false para las que NO son a YouTube (ej.
 // la llamada a la API de Anthropic en /genero).
 // ========================================
-async function fetchConTimeout(url, options = {}, timeoutMs = 8000, viaProxy = true, agenteOverride = null) {
+async function fetchConTimeout(url, options = {}, timeoutMs = 8000, viaProxy = true, agenteOverride = null, etiquetaOverride = null) {
   const ctrl = new AbortController();
   const t = setTimeout(() => ctrl.abort(), timeoutMs);
   try {
@@ -545,15 +721,18 @@ async function fetchConTimeout(url, options = {}, timeoutMs = 8000, viaProxy = t
     }
     // 🩹 (ago-2026) Reenviar las cookies acumuladas de YouTube — ver cookie
     // jar más arriba. Solo aplica a peticiones a youtube.com (no a Anthropic).
+    // 🩹 (sep-2026) etiquetaOverride decide de CUÁL jar por proxy — "quotaguard"
+    // por defecto para las llamadas que no pasan por la cascada de /search.
     const esYoutube = url.includes("youtube.com");
+    const etiquetaCookie = etiquetaOverride || "quotaguard";
     if (esYoutube) {
-      const cookieHeader = cookieHeaderActual();
+      const cookieHeader = cookieHeaderDeProxy(etiquetaCookie);
       if (cookieHeader) {
         finalOptions.headers = { ...(finalOptions.headers || {}), "Cookie": cookieHeader };
       }
     }
     const response = await fetch(url, finalOptions);
-    if (esYoutube) leerCookiesDeRespuesta(response);
+    if (esYoutube) leerCookiesDeRespuesta(response, etiquetaCookie);
     return response;
   } finally {
     clearTimeout(t);
@@ -655,7 +834,7 @@ app.get("/estado-proxies", (req, res) => {
 async function intentarScrapeYouTube(query, agente, etiqueta, timeoutMs = 8000) {
   try {
     const searchUrl = `https://www.youtube.com/results?search_query=${encodeURIComponent(query)}`;
-    const response  = await fetchConTimeout(searchUrl, { headers: HEADERS }, timeoutMs, false, agente);
+    const response  = await fetchConTimeout(searchUrl, { headers: headersDeProxy(etiqueta) }, timeoutMs, false, agente, etiqueta);
     const html      = await response.text();
     const match     = html.match(/var ytInitialData = ({.*?});/s);
     if (!match) {
@@ -687,6 +866,8 @@ async function intentarScrapeYouTube(query, agente, etiqueta, timeoutMs = 8000) 
     return videos;
   } catch (err) {
     console.error(`⚠️ /search (${etiqueta}): error — ${err.message}`);
+    // 🩹 (sep-2026) Un timeout aislado también entra al enfriamiento (más
+    // corto que un bloqueo real) — ver marcarTimeoutTransitorio arriba.
     marcarTimeoutTransitorio(etiqueta);
     return null;
   }
@@ -787,11 +968,6 @@ app.get("/search", limiteYouTube, async (req, res) => {
     // ── Capa 0: proxies propios del local (si tiene asignados) ──
     // Aislamiento estricto (decisión de Hache): esta capa NUNCA toca un
     // proxy asignado a OTRO local — solo recorre su propia lista.
-    //
-    // 🩹 (sep-2026) Ahora salta gratis los propios que estén en enfriamiento
-    // (mismo criterio que el pool general de abajo) y avanza el puntero
-    // también en ÉXITO, no solo en falla — ver comentario largo junto al
-    // bloque "PUNTERO COMPARTIDO" más arriba.
     const propios = localId ? (asignacionPorLocal[localId] || []) : [];
     if (propios.length) {
       if (!(punterosPorLocal[localId] < propios.length)) punterosPorLocal[localId] = 0;
@@ -799,13 +975,14 @@ app.get("/search", limiteYouTube, async (req, res) => {
         const i = punterosPorLocal[localId];
         const etiqueta = propios[i];
         const proxyInfo = proxiesPorEtiqueta[etiqueta];
+        // 🩹 (sep-2026) Saltar gratis un proxy propio ya en enfriamiento —
+        // ya sabemos que está descansando, no hace falta pagar otro timeout
+        // de 2s para descubrirlo de nuevo.
         if (proxyInfo && !estaEnEnfriamiento(etiqueta)) {
           videos = await intentarScrapeYouTube(query, proxyInfo.agente, etiqueta, TIMEOUT_DESCUBRIMIENTO_MS);
-          avanzarPunteroLocalSiSigueEn(localId, i);
           if (videos) { fuente = etiqueta; break; }
-        } else {
-          avanzarPunteroLocalSiSigueEn(localId, i);
         }
+        avanzarPunteroLocalSiSigueEn(localId, i);
       }
       if (!videos) {
         // Ciclo PROPIO de este local agotado — se reinicia ya (no hace
@@ -824,32 +1001,31 @@ app.get("/search", limiteYouTube, async (req, res) => {
     // calcula UNA sola vez (no en cada chequeo) para que la condición de
     // "se agotó" de más abajo use exactamente la misma lista, sin riesgo
     // de que una asignación cambie a mitad de esta misma búsqueda.
-    //
-    // 🩹 (sep-2026) Dos cambios tras el incidente del 2 sep: (1) si el proxy
-    // en turno ya está en enfriamiento (por bloqueo real O por timeout
-    // reciente — ver marcarTimeoutTransitorio), se salta gratis, sin pagar
-    // otro timeout de 2s para descubrir lo que ya se sabía; (2) el puntero
-    // avanza también cuando un proxy SÍ responde bien, no solo cuando
-    // falla — así el tráfico se reparte solo entre los proxies sanos en vez
-    // de quedarse pegado toda la noche en el primero que funcionó.
     const pool = poolGeneral();
     if (!videos) {
       if (!(punteroDatacenter < pool.length)) punteroDatacenter = 0;
       while (punteroDatacenter < pool.length) {
         const i = punteroDatacenter;
         const { agente, etiqueta } = pool[i];
+        // 🩹 (sep-2026) Saltar gratis un proxy ya en enfriamiento (por
+        // bloqueo real o por timeout reciente — ver marcarTimeoutTransitorio)
+        // en vez de pagar otro timeout de 2s para descubrir lo que ya se
+        // sabía.
         if (estaEnEnfriamiento(etiqueta)) {
-          avanzarPunteroSiSigueEn(i); // saltar gratis, ya sabemos que está descansando
+          avanzarPunteroSiSigueEn(i);
           continue;
         }
         videos = await intentarScrapeYouTube(query, agente, etiqueta, TIMEOUT_DESCUBRIMIENTO_MS);
-        avanzarPunteroSiSigueEn(i); // avanza en éxito TAMBIÉN — reparte la carga solo
         if (videos) { fuente = etiqueta; break; }
+        // Falló este proxy → avanza el puntero (solo si nadie más ya lo hizo
+        // por esta misma falla) y sigue de una vez con el siguiente, sin
+        // pausa extra entre intentos.
+        avanzarPunteroSiSigueEn(i);
       }
     }
  
     if (!videos && punteroDatacenter >= pool.length) {
-      // Ciclo de proxies de centro de datos agotado — un solo intento a la
+      // Ciclo de proxies residenciales estáticos agotado — un solo intento a la
       // API oficial, sin quedarse ahí para las próximas búsquedas.
       videos = await buscarViaAPIOficial(query);
       if (videos) {
@@ -871,7 +1047,7 @@ app.get("/search", limiteYouTube, async (req, res) => {
     if (!videos && residentialProxyAgent) {
       // Último recurso, por fuera del puntero — cobra por GB, así que se
       // paga solo cuando de verdad no quedó nada más, no se reintenta en
-      // ciclos futuros como los proxies de centro de datos.
+      // ciclos futuros como los proxies residenciales estáticos.
       videos = await intentarScrapeYouTube(query, residentialProxyAgent, "residencial");
       if (videos) fuente = "residencial";
     }
@@ -1029,7 +1205,7 @@ app.get("/audio", limiteYouTube, async (req, res) => {
     }
  
     console.log("⚠️ Innertube no dio formatos, intentando scraping...");
-    const pageRes  = await fetchConTimeout(`https://www.youtube.com/watch?v=${videoId}`, { headers: HEADERS });
+    const pageRes  = await fetchConTimeout(`https://www.youtube.com/watch?v=${videoId}`, { headers: headersDeProxy("quotaguard") });
     const html     = await pageRes.text();
     // 🩹 (ago-2026) Mismo detector de bloqueo que /search — ver comentario
     // junto al circuit breaker, arriba del archivo.
@@ -1072,7 +1248,7 @@ app.get("/duration", limiteYouTube, async (req, res) => {
  
   try {
     const url      = `https://www.youtube.com/watch?v=${videoId}`;
-    const response = await fetchConTimeout(url, { headers: HEADERS });
+    const response = await fetchConTimeout(url, { headers: headersDeProxy("quotaguard") });
     const html     = await response.text();
     marcarPosibleBloqueo(html, response.status, "quotaguard");
  
