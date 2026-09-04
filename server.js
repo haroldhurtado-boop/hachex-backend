@@ -172,6 +172,14 @@ function cookieHeaderActual() {
 // sin importar el motivo del fallo). Este circuit breaker se deja intacto
 // porque sigue siendo información real y útil para /estado-proxies y los
 // logs (distingue una falla cualquiera de un bloqueo real de YouTube).
+//
+// 🩹 (sep-2026) AMPLIADO: ahora también entra aquí un timeout aislado (no
+// solo el patrón de captcha/429), con su propio enfriamiento más corto — ver
+// ENFRIAMIENTO_TIMEOUT_MS y marcarTimeoutTransitorio() más abajo. Motivo:
+// la noche del 2 sep, 5 proxies fallaron por timeout (no por bloqueo real de
+// YouTube) y el puntero, al no tener forma de saberlo, los descartó sin
+// posibilidad de reintento el resto de la noche — todo el tráfico terminó
+// concentrado en una sola IP.
 const ENFRIAMIENTO_BLOQUEO_MS = 90 * 1000; // 90s
 const enfriamientoPorProxy = {}; // { etiqueta: timestamp hasta cuándo esperar }
  
@@ -190,6 +198,20 @@ function marcarPosibleBloqueo(html, status, etiqueta) {
  
 function estaEnEnfriamiento(etiqueta) {
   return Date.now() < (enfriamientoPorProxy[etiqueta] || 0);
+}
+ 
+// 🩹 (sep-2026) Enfriamiento corto para timeouts aislados — distinto del de
+// bloqueo real de arriba (90s). Un timeout puntual suele ser un bache de red
+// pasajero, no un bloqueo de YouTube, así que se castiga menos tiempo (45s).
+// No acorta un enfriamiento más largo que ya esté activo (ej. si ese proxy
+// ya está en enfriamiento por bloqueo real, no lo bajamos a 45s).
+const ENFRIAMIENTO_TIMEOUT_MS = 45 * 1000; // 45s
+ 
+function marcarTimeoutTransitorio(etiqueta) {
+  const hasta = Date.now() + ENFRIAMIENTO_TIMEOUT_MS;
+  if (hasta > (enfriamientoPorProxy[etiqueta] || 0)) {
+    enfriamientoPorProxy[etiqueta] = hasta;
+  }
 }
  
 // ========================================
@@ -300,6 +322,14 @@ console.log(`✅ ${proxiesDatacenter.length} proxy(s) de centro de datos en rota
 // los proxies vuelven a tener su oportunidad, sin importar que hayan
 // quedado descartados minutos antes.
 //
+// 🩹 (sep-2026) NOTA IMPORTANTE tras el incidente del 2 sep: "sin importar
+// que hayan quedado descartados minutos antes" seguía siendo cierto en el
+// sentido de que el ciclo completo se reinicia — pero mientras el ciclo NO
+// se agota (tráfico bajo, un solo local), un proxy descartado por un timeout
+// puntual se quedaba fuera el resto de la noche sin ninguna forma de
+// recuperarse antes de eso. Los dos cambios de abajo (saltar los que están
+// en enfriamiento, y avanzar el puntero también en ÉXITO) atacan justo eso.
+//
 // 🩹 (ago-2026 v5) ASIGNACIÓN DE PROXIES POR LOCAL — pedido de Hache para
 // repartir tráfico entre locales y evitar que uno concentre demasiado en
 // una sola IP. `punteroDatacenter` de arriba pasa a llamarse "pool
@@ -326,16 +356,16 @@ console.log(`✅ ${proxiesDatacenter.length} proxy(s) de centro de datos en rota
 // chico) — nunca el local completo.
 // ========================================
 let punteroDatacenter = 0; // índice sobre el POOL GENERAL (ver poolGeneral())
-
+ 
 const punterosPorLocal = {};        // { localId: índice sobre asignacionPorLocal[localId] }
 const asignacionPorLocal = {};      // { localId: ["respaldo_5", ...] }
 const listenersProxyPorLocal = {};  // { localId: true } — evita doble listener si el índice repite el evento
-
+ 
 // Lookup rápido etiqueta → { agente, etiqueta } para no recorrer el arreglo
 // completo cada vez que un local necesita usar SU proxy por etiqueta.
 const proxiesPorEtiqueta = {};
 for (const p of proxiesDatacenter) proxiesPorEtiqueta[p.etiqueta] = p;
-
+ 
 function escucharAsignacionDeLocal(localId) {
   if (!db || listenersProxyPorLocal[localId]) return;
   listenersProxyPorLocal[localId] = true;
@@ -353,7 +383,7 @@ function escucharAsignacionDeLocal(localId) {
     }
   }, err => console.error(`⚠️ Error escuchando proxiesAsignados de ${localId}:`, err.message));
 }
-
+ 
 // Índice liviano de "qué locales tienen algo asignado" — nunca descarga los
 // locales completos, solo esta lista de booleans chica. admin.html escribe
 // acá cada vez que guarda una asignación (ver comentario arriba). El
@@ -365,7 +395,7 @@ function iniciarEscuchaAsignacionesProxy() {
     if (snap.val()) escucharAsignacionDeLocal(snap.key);
   });
 }
-
+ 
 // Arreglo de {agente,etiqueta} de los proxies de centro de datos que NO
 // están asignados a ningún local — es lo que antes era simplemente
 // "proxiesDatacenter" a secas. Se recalcula en cada llamado (barato: como
@@ -378,7 +408,7 @@ function poolGeneral() {
   }
   return proxiesDatacenter.filter(p => !asignados.has(p.etiqueta));
 }
-
+ 
 // 2s: tiempo que se le da a un proxy de esta capa para responder antes de
 // darlo por caído y avanzar el puntero. Elegido junto con Hache: raspar
 // YouTube con un proxy sano suele tardar 1-2s, así que 2s da margen sin
@@ -387,7 +417,7 @@ function poolGeneral() {
 // respuesta simplemente lenta, no caída. La API y el proxy residencial
 // (fuera de este puntero) NO cambian su timeout — se dejan en 8s.
 const TIMEOUT_DESCUBRIMIENTO_MS = 2000;
-
+ 
 // Avanza el puntero del POOL GENERAL solo si sigue apuntando a la posición
 // que acaba de fallar — evita que varias búsquedas concurrentes, al fallar
 // casi al mismo tiempo contra el mismo proxy, hagan saltar el puntero
@@ -399,7 +429,7 @@ function avanzarPunteroSiSigueEn(indice) {
     punteroDatacenter = indice + 1;
   }
 }
-
+ 
 // Misma idea que la de arriba, pero para el puntero PROPIO de un local. Se
 // mantiene como función separada (no una genérica con parámetros por
 // referencia) porque opera sobre `punterosPorLocal[localId]`, no sobre una
@@ -566,10 +596,10 @@ app.get("/estado-proxies", (req, res) => {
       (asignadoA[etiqueta] = asignadoA[etiqueta] || []).push(localId);
     }
   }
-
+ 
   const pool = poolGeneral();
   const indicePool = new Map(pool.map((p, i) => [p.etiqueta, i]));
-
+ 
   const proxies = proxiesDatacenter.map(p => ({
     etiqueta: p.etiqueta,
     disponible: !estaEnEnfriamiento(p.etiqueta),
@@ -582,7 +612,7 @@ app.get("/estado-proxies", (req, res) => {
  
   const hoy = fechaPacificoHoy();
   const apiUsadasHoy = (cuotaAPI.fecha === hoy) ? cuotaAPI.usadas : 0;
-
+ 
   const asignacionesPorLocal = Object.fromEntries(
     Object.entries(asignacionPorLocal).map(([localId, etiquetas]) => [
       localId,
@@ -657,6 +687,7 @@ async function intentarScrapeYouTube(query, agente, etiqueta, timeoutMs = 8000) 
     return videos;
   } catch (err) {
     console.error(`⚠️ /search (${etiqueta}): error — ${err.message}`);
+    marcarTimeoutTransitorio(etiqueta);
     return null;
   }
 }
@@ -752,10 +783,15 @@ app.get("/search", limiteYouTube, async (req, res) => {
     let videos = null;
     let fuente = null;
     let cicloAgotado = false;
-
+ 
     // ── Capa 0: proxies propios del local (si tiene asignados) ──
     // Aislamiento estricto (decisión de Hache): esta capa NUNCA toca un
     // proxy asignado a OTRO local — solo recorre su propia lista.
+    //
+    // 🩹 (sep-2026) Ahora salta gratis los propios que estén en enfriamiento
+    // (mismo criterio que el pool general de abajo) y avanza el puntero
+    // también en ÉXITO, no solo en falla — ver comentario largo junto al
+    // bloque "PUNTERO COMPARTIDO" más arriba.
     const propios = localId ? (asignacionPorLocal[localId] || []) : [];
     if (propios.length) {
       if (!(punterosPorLocal[localId] < propios.length)) punterosPorLocal[localId] = 0;
@@ -763,11 +799,13 @@ app.get("/search", limiteYouTube, async (req, res) => {
         const i = punterosPorLocal[localId];
         const etiqueta = propios[i];
         const proxyInfo = proxiesPorEtiqueta[etiqueta];
-        if (proxyInfo) {
+        if (proxyInfo && !estaEnEnfriamiento(etiqueta)) {
           videos = await intentarScrapeYouTube(query, proxyInfo.agente, etiqueta, TIMEOUT_DESCUBRIMIENTO_MS);
+          avanzarPunteroLocalSiSigueEn(localId, i);
           if (videos) { fuente = etiqueta; break; }
+        } else {
+          avanzarPunteroLocalSiSigueEn(localId, i);
         }
-        avanzarPunteroLocalSiSigueEn(localId, i);
       }
       if (!videos) {
         // Ciclo PROPIO de este local agotado — se reinicia ya (no hace
@@ -777,7 +815,7 @@ app.get("/search", limiteYouTube, async (req, res) => {
         punterosPorLocal[localId] = 0;
       }
     }
-
+ 
     // ── Capa 1: pool general (proxies no asignados a ningún local) ──
     // Puntero compartido, sin retroceso — ver bloque "PUNTERO COMPARTIDO"
     // más arriba. Se arranca en la posición actual (no siempre en 0), se
@@ -786,18 +824,27 @@ app.get("/search", limiteYouTube, async (req, res) => {
     // calcula UNA sola vez (no en cada chequeo) para que la condición de
     // "se agotó" de más abajo use exactamente la misma lista, sin riesgo
     // de que una asignación cambie a mitad de esta misma búsqueda.
+    //
+    // 🩹 (sep-2026) Dos cambios tras el incidente del 2 sep: (1) si el proxy
+    // en turno ya está en enfriamiento (por bloqueo real O por timeout
+    // reciente — ver marcarTimeoutTransitorio), se salta gratis, sin pagar
+    // otro timeout de 2s para descubrir lo que ya se sabía; (2) el puntero
+    // avanza también cuando un proxy SÍ responde bien, no solo cuando
+    // falla — así el tráfico se reparte solo entre los proxies sanos en vez
+    // de quedarse pegado toda la noche en el primero que funcionó.
     const pool = poolGeneral();
     if (!videos) {
       if (!(punteroDatacenter < pool.length)) punteroDatacenter = 0;
       while (punteroDatacenter < pool.length) {
         const i = punteroDatacenter;
         const { agente, etiqueta } = pool[i];
+        if (estaEnEnfriamiento(etiqueta)) {
+          avanzarPunteroSiSigueEn(i); // saltar gratis, ya sabemos que está descansando
+          continue;
+        }
         videos = await intentarScrapeYouTube(query, agente, etiqueta, TIMEOUT_DESCUBRIMIENTO_MS);
+        avanzarPunteroSiSigueEn(i); // avanza en éxito TAMBIÉN — reparte la carga solo
         if (videos) { fuente = etiqueta; break; }
-        // Falló este proxy → avanza el puntero (solo si nadie más ya lo hizo
-        // por esta misma falla) y sigue de una vez con el siguiente, sin
-        // pausa extra entre intentos.
-        avanzarPunteroSiSigueEn(i);
       }
     }
  
